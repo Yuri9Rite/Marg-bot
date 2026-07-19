@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: marginal-bot
+    runtime: docker
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
