@@ -1,9 +1,12 @@
 services:
-  - type: worker
+  - type: web
     name: marginal-bot
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn econ_bot:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: BOT_TOKEN
         sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
