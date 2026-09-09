@@ -3,6 +3,8 @@ import logging
 import datetime
 import os
 
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ConversationHandler, MessageHandler, filters
@@ -1035,6 +1037,121 @@ def main() -> None:
 
     # Run the bot until the user presses Ctrl-C
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+def build_application() -> Application:
+    """Build the Telegram application and register all handlers."""
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        raise ValueError("BOT_TOKEN environment variable is not set!")
+
+    application = Application.builder().token(token).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            MENU: [
+                CallbackQueryHandler(break_even_start, pattern='^break_even$\\b'),
+                CallbackQueryHandler(margin_start, pattern='^margin$\\b'),
+                CallbackQueryHandler(roi_start, pattern='^roi$\\b'),
+                CallbackQueryHandler(unit_cost_start, pattern='^unit_cost$\\b'),
+                CallbackQueryHandler(elasticity_start, pattern='^elasticity$\\b'),
+                CallbackQueryHandler(profit_loss_start, pattern='^profit_loss$\\b'),
+                CallbackQueryHandler(avg_marginal_costs_start, pattern='^avg_marginal_costs$\\b'),
+                CallbackQueryHandler(markup_discount_start, pattern='^markup_discount$\\b'),
+                CallbackQueryHandler(payback_period_start, pattern='^payback_period$\\b'),
+                CallbackQueryHandler(operating_leverage_start, pattern='^operating_leverage$\\b'),
+                CallbackQueryHandler(npv_start, pattern='^npv$\\b'),
+                CallbackQueryHandler(optimal_price_start, pattern='^optimal_price$\\b'),
+                CallbackQueryHandler(show_history, pattern='^history$\\b'),
+            ],
+            BREAK_EVEN_FIXED_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, break_even_fixed_costs)],
+            BREAK_EVEN_VARIABLE_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, break_even_variable_cost)],
+            BREAK_EVEN_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, break_even_price), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+            MARGIN_REVENUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, margin_revenue)],
+            MARGIN_COST_OF_GOODS: [MessageHandler(filters.TEXT & ~filters.COMMAND, margin_cost_of_goods), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+            ROI_PROFIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, roi_profit)],
+            ROI_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, roi_cost), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+            UNIT_COST_FIXED_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, unit_cost_fixed_costs)],
+            UNIT_COST_VARIABLE_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, unit_cost_variable_costs)],
+            UNIT_COST_UNITS: [MessageHandler(filters.TEXT & ~filters.COMMAND, unit_cost_units), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+            ELASTICITY_QUANTITY_CHANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, elasticity_quantity_change)],
+            ELASTICITY_PRICE_CHANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, elasticity_price_change), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+            PROFIT_LOSS_REVENUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_loss_revenue)],
+            PROFIT_LOSS_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_loss_costs), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+            AVG_MARGINAL_COST_CURRENT_TOTAL_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, avg_marginal_costs_current_total_cost)],
+            AVG_MARGINAL_COST_PREVIOUS_TOTAL_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, avg_marginal_costs_previous_total_cost)],
+            AVG_MARGINAL_COST_CURRENT_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, avg_marginal_costs_current_quantity)],
+            AVG_MARGINAL_COST_PREVIOUS_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, avg_marginal_costs_previous_quantity), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+            MARKUP_DISCOUNT_TYPE: [CallbackQueryHandler(markup_discount_type, pattern='^markup$|^discount$\\b')],
+            MARKUP_DISCOUNT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, markup_discount_price)],
+            MARKUP_DISCOUNT_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, markup_discount_percentage), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+            PAYBACK_INVESTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payback_investment)],
+            PAYBACK_CASH_FLOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, payback_cash_flow), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+            OPERATING_LEVERAGE_REVENUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, operating_leverage_revenue)],
+            OPERATING_LEVERAGE_VARIABLE_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, operating_leverage_variable_costs)],
+            OPERATING_LEVERAGE_FIXED_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, operating_leverage_fixed_costs), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+            NPV_INITIAL_INVESTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, npv_initial_investment)],
+            NPV_CASH_FLOW_YEAR1: [MessageHandler(filters.TEXT & ~filters.COMMAND, npv_cash_flow_year1)],
+            NPV_DISCOUNT_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, npv_discount_rate), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+            OPTIMAL_PRICE_UNIT_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, optimal_price_unit_cost)],
+            OPTIMAL_PRICE_MARKUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, optimal_price_markup), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+            HISTORY: [CallbackQueryHandler(show_history, pattern='^history$\\b'), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+        },
+        fallbacks=[CommandHandler("start", start), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+    )
+    application.add_handler(conv_handler)
+    return application
+
+
+telegram_application = build_application()
+app = FastAPI(title="Marginal Telegram Bot")
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    external_url = os.environ.get("RENDER_EXTERNAL_URL")
+    secret = os.environ.get("WEBHOOK_SECRET")
+    if not external_url or not secret:
+        raise RuntimeError("RENDER_EXTERNAL_URL and WEBHOOK_SECRET must be set")
+
+    await telegram_application.initialize()
+    await telegram_application.start()
+    webhook_url = f"{external_url.rstrip('/')}/telegram/webhook"
+    await telegram_application.bot.set_webhook(
+        url=webhook_url,
+        secret_token=secret,
+        allowed_updates=Update.ALL_TYPES,
+    )
+    logger.info("Telegram webhook configured: %s", webhook_url)
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await telegram_application.bot.delete_webhook()
+    await telegram_application.stop()
+    await telegram_application.shutdown()
+
+
+@app.get("/")
+async def healthcheck() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+) -> JSONResponse:
+    expected_secret = os.environ.get("WEBHOOK_SECRET")
+    if not expected_secret or x_telegram_bot_api_secret_token != expected_secret:
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
+    payload = await request.json()
+    update = Update.de_json(payload, telegram_application.bot)
+    await telegram_application.process_update(update)
+    return JSONResponse({"ok": True})
+
 
 if __name__ == '__main__':
     main()
