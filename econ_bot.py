@@ -3,7 +3,7 @@ import logging
 import datetime
 import os
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ConversationHandler, MessageHandler, filters
 )
