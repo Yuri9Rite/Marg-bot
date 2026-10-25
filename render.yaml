@@ -1,12 +1,20 @@
+# Render Blueprint — deploy with one click at https://render.com/blueprints
 services:
   - type: web
     name: marginal-bot
     runtime: python
     plan: free
+    rootDir: .
     buildCommand: pip install -r requirements.txt
+    # Binds to $PORT automatically; webhook mode reads RENDER_EXTERNAL_URL.
     startCommand: uvicorn econ_bot:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
     envVars:
-      - key: BOT_TOKEN
+      - key: BOT_TOKEN          # set in the Render dashboard (mark as secret)
         sync: false
-      - key: WEBHOOK_SECRET
+      - key: WEBHOOK_SECRET     # generated once; Telegram echoes it back
         generateValue: true
+      - key: PYTHON_VERSION
+        value: "3.12"
+      - key: LOG_LEVEL
+        value: INFO

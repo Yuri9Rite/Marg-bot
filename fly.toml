@@ -1,0 +1,33 @@
+# Fly.io configuration — `fly launch` will pick this up.
+# Secrets: fly secrets set BOT_TOKEN=... WEBHOOK_SECRET=...
+# Webhook base URL: fly sets nothing automatically, so run
+#   fly secrets set WEBHOOK_URL=https://<app-name>.fly.dev
+# or switch to polling with: fly secrets set MODE=polling
+
+app = "marginal-bot"
+kill_signal = "SIGINT"
+kill_timeout = 20
+processes = []
+
+[env]
+  PORT = "8000"
+  MODE = "webhook"
+
+[[services]]
+  internal_port = 8000
+  protocol = "tcp"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [services.tcp_checks]
+    grace_period = "5s"
+    interval = "15s"
+    restart_limit = 3
+    timeout = "5s"

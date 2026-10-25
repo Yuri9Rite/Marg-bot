@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+.env.*
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+Dockerfile
+docker-compose.yml
+README.md
+render.yaml
+Procfile
+railway.json
+fly.toml
