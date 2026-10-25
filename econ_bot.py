@@ -1,110 +1,269 @@
+"""Marg-bot — a Telegram bot for micro-economic calculations.
 
-import logging
+Deploy-ready entrypoint supporting two modes:
+
+* **Webhook mode** (default for PaaS platforms such as Render/Fly.io/Railway):
+  run ``uvicorn econ_bot:app --host 0.0.0.0 --port $PORT``.  The Telegram
+  application is initialised inside the ASGI lifespan; the webhook URL is
+  derived from ``RENDER_EXTERNAL_URL`` or ``WEBHOOK_URL`` and protected with
+  ``WEBHOOK_SECRET``.
+
+* **Polling mode** (local development / containers without a public URL):
+  run ``python econ_bot.py`` (or ``python -m econ_bot``).  Set
+  ``MODE=polling`` to force polling even under ``uvicorn econ_bot:app``.
+
+Configuration (environment variables):
+
+    BOT_TOKEN            required — Telegram bot token from @BotFather
+    WEBHOOK_SECRET       strongly recommended in webhook mode — secret token
+                         Telegram echoes back in the
+                         ``X-Telegram-Bot-Api-Secret-Token`` header
+    RENDER_EXTERNAL_URL  webhook base URL (set automatically by Render)
+    WEBHOOK_URL          alternative explicit webhook base URL
+    WEBHOOK_PATH         path Telegram posts to (default: /telegram/webhook)
+    PORT                 port for uvicorn (handled by the platform)
+    MODE                 "webhook" (default) or "polling"
+    LOG_LEVEL            logging level (default: INFO)
+"""
+
+from __future__ import annotations
+
 import datetime
+import logging
 import os
+import re
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ConversationHandler, MessageHandler, filters
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
 
-# Enable logging
+# --------------------------------------------------------------------------- #
+# Logging & configuration                                                     #
+# --------------------------------------------------------------------------- #
+
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
 )
-# set higher logging level for httpx to avoid all GET and POST requests being logged
+# Avoid flooding the log with every GET/POST made by httpx.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("econ_bot")
 
-# States for ConversationHandler
-MENU, \
-BREAK_EVEN_FIXED_COSTS, BREAK_EVEN_VARIABLE_COST, BREAK_EVEN_PRICE, \
-MARGIN_REVENUE, MARGIN_COST_OF_GOODS, ROI_PROFIT, ROI_COST, \
-UNIT_COST_FIXED_COSTS, UNIT_COST_VARIABLE_COSTS, UNIT_COST_UNITS, \
-ELASTICITY_QUANTITY_CHANGE, ELASTICITY_PRICE_CHANGE, \
-PROFIT_LOSS_REVENUE, PROFIT_LOSS_COSTS, \
-AVG_MARGINAL_COST_CURRENT_TOTAL_COST, AVG_MARGINAL_COST_PREVIOUS_TOTAL_COST, \
-AVG_MARGINAL_COST_CURRENT_QUANTITY, AVG_MARGINAL_COST_PREVIOUS_QUANTITY, \
-MARKUP_DISCOUNT_PRICE, MARKUP_DISCOUNT_PERCENTAGE, MARKUP_DISCOUNT_TYPE, \
-PAYBACK_INVESTMENT, PAYBACK_CASH_FLOW, \
-OPERATING_LEVERAGE_REVENUE, OPERATING_LEVERAGE_VARIABLE_COSTS, OPERATING_LEVERAGE_FIXED_COSTS, \
-NPV_INITIAL_INVESTMENT, NPV_CASH_FLOW_YEAR1, NPV_DISCOUNT_RATE, \
-OPTIMAL_PRICE_UNIT_COST, OPTIMAL_PRICE_MARKUP, \
-HISTORY = range(33)
+BOT_TOKEN: str = os.environ["BOT_TOKEN"]  # fail fast if missing
+WEBHOOK_SECRET: Optional[str] = os.environ.get("WEBHOOK_SECRET")
+WEBHOOK_PATH: str = os.environ.get("WEBHOOK_PATH", "/telegram/webhook")
+RUN_MODE: str = os.environ.get("MODE", "webhook").strip().lower()
 
-# --- Helper functions for calculations ---
+MAX_HISTORY_ENTRIES = 50  # keep per-user history bounded
+TELEGRAM_MESSAGE_LIMIT = 4096
 
-def calculate_break_even(fixed_costs, variable_cost_per_unit, price_per_unit):
+# States for ConversationHandler ---------------------------------------------- #
+# fmt: off
+(MENU,
+ BREAK_EVEN_FIXED_COSTS, BREAK_EVEN_VARIABLE_COST, BREAK_EVEN_PRICE,
+ MARGIN_REVENUE, MARGIN_COST_OF_GOODS, ROI_PROFIT, ROI_COST,
+ UNIT_COST_FIXED_COSTS, UNIT_COST_VARIABLE_COSTS, UNIT_COST_UNITS,
+ ELASTICITY_QUANTITY_CHANGE, ELASTICITY_PRICE_CHANGE,
+ PROFIT_LOSS_REVENUE, PROFIT_LOSS_COSTS,
+ AVG_MARGINAL_COST_CURRENT_TOTAL_COST, AVG_MARGINAL_COST_PREVIOUS_TOTAL_COST,
+ AVG_MARGINAL_COST_CURRENT_QUANTITY, AVG_MARGINAL_COST_PREVIOUS_QUANTITY,
+ MARKUP_DISCOUNT_PRICE, MARKUP_DISCOUNT_PERCENTAGE, MARKUP_DISCOUNT_TYPE,
+ PAYBACK_INVESTMENT, PAYBACK_CASH_FLOW,
+ OPERATING_LEVERAGE_REVENUE, OPERATING_LEVERAGE_VARIABLE_COSTS,
+ OPERATING_LEVERAGE_FIXED_COSTS,
+ NPV_INITIAL_INVESTMENT, NPV_CASH_FLOW_YEAR1, NPV_DISCOUNT_RATE,
+ OPTIMAL_PRICE_UNIT_COST, OPTIMAL_PRICE_MARKUP,
+ HISTORY) = range(33)
+# fmt: on
+
+# --------------------------------------------------------------------------- #
+# Small helpers                                                               #
+# --------------------------------------------------------------------------- #
+
+
+def parse_number(text: str) -> float:
+    """Parse a user-supplied number, accepting comma decimal separators."""
+    return float(text.strip().replace(",", ".").replace(" ", ""))
+
+
+MENU_ITEMS: list[tuple[str, str]] = [
+    ("Точка безубыточности", "break_even"),
+    ("Маржинальность", "margin"),
+    ("ROI", "roi"),
+    ("Себестоимость единицы продукции", "unit_cost"),
+    ("Эластичность спроса", "elasticity"),
+    ("Прибыль/убыток", "profit_loss"),
+    ("Средние и предельные издержки", "avg_marginal_costs"),
+    ("Наценка и скидка", "markup_discount"),
+    ("Срок окупаемости", "payback_period"),
+    ("Операционный рычаг", "operating_leverage"),
+    ("Расчёт NPV", "npv"),
+    ("Расчёт оптимальной цены", "optimal_price"),
+    ("История расчётов", "history"),
+]
+
+
+def main_menu_markup() -> InlineKeyboardMarkup:
+    """Inline keyboard with every available calculation."""
+    rows = [[InlineKeyboardButton(label, callback_data=cb)] for label, cb in MENU_ITEMS]
+    return InlineKeyboardMarkup(rows)
+
+
+def result_markup() -> InlineKeyboardMarkup:
+    """Keyboard shown underneath a calculation result."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]]
+    )
+
+
+def record_result(context: ContextTypes.DEFAULT_TYPE, result_text: str) -> None:
+    """Append a timestamped one-line summary to the bounded per-user history."""
+    history: list[str] = context.user_data.setdefault("history", [])
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    name = context.user_data.get("current_calculation", "Расчёт")
+    # Collapse newlines so each entry stays compact in the history view.
+    summary = " | ".join(line.strip() for line in result_text.splitlines() if line.strip())
+    history.append(f"[{timestamp}] {name}: {summary}")
+    del history[:-MAX_HISTORY_ENTRIES]
+
+
+async def send_long_message(
+    update: Update,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
+    """Reply with text, splitting safely if it exceeds Telegram's limit."""
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        cut = len(remaining)
+        if cut > TELEGRAM_MESSAGE_LIMIT:
+            cut = remaining.rfind("\n", 0, TELEGRAM_MESSAGE_LIMIT)
+            if cut <= 0:
+                cut = TELEGRAM_MESSAGE_LIMIT
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:]
+    for i, chunk in enumerate(chunks):
+        await update.message.reply_text(
+            chunk, reply_markup=reply_markup if i == len(chunks) - 1 else None
+        )
+
+
+async def safe_edit(query, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
+    """``edit_message_text`` that ignores 'message is not modified' errors."""
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+
+
+def numeric_state_handler(callback: Callable[..., Awaitable[int]]) -> MessageHandler:
+    """Wrap a state callback so unexpected errors end the conversation
+    gracefully instead of silently stalling the user."""
+
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        try:
+            return await callback(update, context)
+        except Exception:  # pragma: no cover - defensive guard
+            logger.exception("Unhandled error in conversation state")
+            await update.message.reply_text(
+                "Что-то пошло не так. Расчёт сброшен — набери /start, чтобы начать заново."
+            )
+            return ConversationHandler.END
+
+    return MessageHandler(filters.TEXT & ~filters.COMMAND, wrapped)
+
+
+# --------------------------------------------------------------------------- #
+# Calculation functions (pure — easy to unit-test)                            #
+# --------------------------------------------------------------------------- #
+
+
+def calculate_break_even(fixed_costs: float, variable_cost_per_unit: float, price_per_unit: float):
     if (price_per_unit - variable_cost_per_unit) <= 0:
-        return None, None # Avoid division by zero or negative contribution margin
+        return None, None  # avoid division by zero / negative contribution margin
     break_even_units = fixed_costs / (price_per_unit - variable_cost_per_unit)
     break_even_revenue = break_even_units * price_per_unit
     return break_even_units, break_even_revenue
 
-def calculate_margin(revenue, cost_of_goods):
+
+def calculate_margin(revenue: float, cost_of_goods: float):
     if revenue == 0:
         return None, None
     absolute_margin = revenue - cost_of_goods
     percentage_margin = (absolute_margin / revenue) * 100
     return absolute_margin, percentage_margin
 
-def calculate_roi(profit_from_investment, cost_of_investment):
+
+def calculate_roi(profit_from_investment: float, cost_of_investment: float) -> Optional[float]:
     if cost_of_investment == 0:
         return None
-    roi = (profit_from_investment / cost_of_investment) * 100
-    return roi
+    return (profit_from_investment / cost_of_investment) * 100
 
-def calculate_unit_cost(total_fixed_costs, total_variable_costs, number_of_units):
+
+def calculate_unit_cost(total_fixed_costs: float, total_variable_costs: float,
+                        number_of_units: float) -> Optional[float]:
     if number_of_units == 0:
         return None
-    total_costs = total_fixed_costs + total_variable_costs
-    unit_cost = total_costs / number_of_units
-    return unit_cost
+    return (total_fixed_costs + total_variable_costs) / number_of_units
 
-def calculate_elasticity(quantity_change, price_change):
+
+def calculate_elasticity(quantity_change: float, price_change: float):
     if price_change == 0:
         return None, "Невозможно рассчитать эластичность при нулевом изменении цены."
     elasticity = quantity_change / price_change
-    interpretation = ""
     if elasticity < -1:
         interpretation = "Эластичный спрос (значительное изменение спроса при изменении цены)"
-    elif elasticity > -1 and elasticity < 0:
+    elif -1 < elasticity < 0:
         interpretation = "Неэластичный спрос (незначительное изменение спроса при изменении цены)"
     elif elasticity == -1:
         interpretation = "Единичная эластичность (изменение спроса пропорционально изменению цены)"
     elif elasticity == 0:
         interpretation = "Совершенно неэластичный спрос (спрос не меняется при изменении цены)"
-    elif elasticity > 0:
+    else:
         interpretation = "Товар Гиффена или Веблена (редкий случай, когда спрос растет с ростом цены)"
     return elasticity, interpretation
 
-def calculate_profit_loss(total_revenue, total_costs):
+
+def calculate_profit_loss(total_revenue: float, total_costs: float):
     profit_loss = total_revenue - total_costs
     status = "Прибыль" if profit_loss >= 0 else "Убыток"
     return profit_loss, status
 
-def calculate_avg_marginal_costs(current_total_cost, previous_total_cost, current_quantity, previous_quantity):
+
+def calculate_avg_marginal_costs(current_total_cost: float, previous_total_cost: float,
+                                 current_quantity: float, previous_quantity: float):
     if current_quantity == 0:
         return None, None
     avg_cost = current_total_cost / current_quantity
-
     if (current_quantity - previous_quantity) == 0:
-        marginal_cost = None # Avoid division by zero
+        marginal_cost = None  # avoid division by zero
     else:
         marginal_cost = (current_total_cost - previous_total_cost) / (current_quantity - previous_quantity)
     return avg_cost, marginal_cost
 
-def calculate_markup_discount(base_price, percentage, is_discount):
-    if is_discount:
-        new_price = base_price * (1 - percentage / 100)
-    else:
-        new_price = base_price * (1 + percentage / 100)
-    return new_price
 
-def calculate_payback_period(initial_investment, annual_cash_flow):
+def calculate_markup_discount(base_price: float, percentage: float, is_discount: bool) -> float:
+    factor = (1 - percentage / 100) if is_discount else (1 + percentage / 100)
+    return base_price * factor
+
+
+def calculate_payback_period(initial_investment: float, annual_cash_flow: float):
     if annual_cash_flow <= 0:
         return None, None
     payback_years = initial_investment / annual_cash_flow
@@ -112,1047 +271,1093 @@ def calculate_payback_period(initial_investment, annual_cash_flow):
     months = round((payback_years - years) * 12)
     return years, months
 
-def calculate_operating_leverage(total_revenue, variable_costs, fixed_costs):
-    if total_revenue - variable_costs == 0:
-        return None
+
+def calculate_operating_leverage(total_revenue: float, variable_costs: float,
+                                 fixed_costs: float) -> Optional[float]:
     contribution_margin = total_revenue - variable_costs
+    if contribution_margin == 0:
+        return None
     operating_income = contribution_margin - fixed_costs
     if operating_income == 0:
         return None
-    operating_leverage = contribution_margin / operating_income
-    return operating_leverage
+    return contribution_margin / operating_income
 
-def calculate_npv(initial_investment, cash_flow_year1, discount_rate):
+
+def calculate_npv(initial_investment: float, cash_flow_year1: float,
+                  discount_rate: float) -> Optional[float]:
     if discount_rate <= -100:
-        return None # Discount rate cannot be -100% or less
+        return None  # discount rate cannot be -100% or less
     discount_factor = 1 + (discount_rate / 100)
-    npv = (cash_flow_year1 / discount_factor) - initial_investment
-    return npv
+    return (cash_flow_year1 / discount_factor) - initial_investment
 
-def calculate_optimal_price(unit_cost, desired_markup_percentage):
+
+def calculate_optimal_price(unit_cost: float, desired_markup_percentage: float) -> Optional[float]:
     if desired_markup_percentage <= -100:
-        return None # Markup cannot be -100% or less
-    optimal_price = unit_cost * (1 + desired_markup_percentage / 100)
-    return optimal_price
+        return None  # markup cannot be -100% or less
+    return unit_cost * (1 + desired_markup_percentage / 100)
 
-# --- Bot commands and handlers ---
 
-async def start(update: Update, context) -> int:
-    """Sends a welcome message and shows the main menu."""
-    keyboard = [
-        [InlineKeyboardButton("Точка безубыточности", callback_data='break_even')],
-        [InlineKeyboardButton("Маржинальность", callback_data='margin')],
-        [InlineKeyboardButton("ROI", callback_data='roi')],
-        [InlineKeyboardButton("Себестоимость единицы продукции", callback_data='unit_cost')],
-        [InlineKeyboardButton("Эластичность спроса", callback_data='elasticity')],
-        [InlineKeyboardButton("Прибыль/убыток", callback_data='profit_loss')],
-        [InlineKeyboardButton("Средние и предельные издержки", callback_data='avg_marginal_costs')],
-        [InlineKeyboardButton("Наценка и скидка", callback_data='markup_discount')],
-        [InlineKeyboardButton("Срок окупаемости", callback_data='payback_period')],
-        [InlineKeyboardButton("Операционный рычаг", callback_data='operating_leverage')],
-        [InlineKeyboardButton("Расчёт NPV", callback_data='npv')],
-        [InlineKeyboardButton("Расчёт оптимальной цены", callback_data='optimal_price')],
-        [InlineKeyboardButton("История расчётов", callback_data='history')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+# --------------------------------------------------------------------------- #
+# Menu / generic handlers                                                     #
+# --------------------------------------------------------------------------- #
 
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Send a welcome message and show the main menu."""
+    user = update.effective_user
+    greeting = f"Привет, {user.first_name}!" if user else "Привет!"
     await update.message.reply_text(
-        "Привет! Я бот для расчета микроэкономических показателей. Выбери нужный расчет:",
-        reply_markup=reply_markup
+        f"{greeting}\nЯ бот для расчёта микроэкономических показателей. Выбери нужный расчёт:",
+        reply_markup=main_menu_markup(),
     )
-    # Initialize history for the user if it doesn't exist
-    if 'history' not in context.user_data:
-        context.user_data['history'] = []
+    context.user_data.setdefault("history", [])
     return MENU
 
-async def menu(update: Update, context) -> int:
-    """Displays the main menu."""
+
+async def show_menu_from_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Display the main menu in answer to a callback (also used as 'back')."""
     query = update.callback_query
     await query.answer()
-
-    keyboard = [
-        [InlineKeyboardButton("Точка безубыточности", callback_data='break_even')],
-        [InlineKeyboardButton("Маржинальность", callback_data='margin')],
-        [InlineKeyboardButton("ROI", callback_data='roi')],
-        [InlineKeyboardButton("Себестоимость единицы продукции", callback_data='unit_cost')],
-        [InlineKeyboardButton("Эластичность спроса", callback_data='elasticity')],
-        [InlineKeyboardButton("Прибыль/убыток", callback_data='profit_loss')],
-        [InlineKeyboardButton("Средние и предельные издержки", callback_data='avg_marginal_costs')],
-        [InlineKeyboardButton("Наценка и скидка", callback_data='markup_discount')],
-        [InlineKeyboardButton("Срок окупаемости", callback_data='payback_period')],
-        [InlineKeyboardButton("Операционный рычаг", callback_data='operating_leverage')],
-        [InlineKeyboardButton("Расчёт NPV", callback_data='npv')],
-        [InlineKeyboardButton("Расчёт оптимальной цены", callback_data='optimal_price')],
-        [InlineKeyboardButton("История расчётов", callback_data='history')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        "Выбери нужный расчет:", reply_markup=reply_markup
-    )
+    await safe_edit(query, "Выбери нужный расчёт:", reply_markup=main_menu_markup())
     return MENU
 
-async def back_to_menu(update: Update, context) -> int:
-    """Returns to the main menu."""
-    query = update.callback_query
-    await query.answer()
-    keyboard = [
-        [InlineKeyboardButton("Точка безубыточности", callback_data='break_even')],
-        [InlineKeyboardButton("Маржинальность", callback_data='margin')],
-        [InlineKeyboardButton("ROI", callback_data='roi')],
-        [InlineKeyboardButton("Себестоимость единицы продукции", callback_data='unit_cost')],
-        [InlineKeyboardButton("Эластичность спроса", callback_data='elasticity')],
-        [InlineKeyboardButton("Прибыль/убыток", callback_data='profit_loss')],
-        [InlineKeyboardButton("Средние и предельные издержки", callback_data='avg_marginal_costs')],
-        [InlineKeyboardButton("Наценка и скидка", callback_data='markup_discount')],
-        [InlineKeyboardButton("Срок окупаемости", callback_data='payback_period')],
-        [InlineKeyboardButton("Операционный рычаг", callback_data='operating_leverage')],
-        [InlineKeyboardButton("Расчёт NPV", callback_data='npv')],
-        [InlineKeyboardButton("Расчёт оптимальной цены", callback_data='optimal_price')],
-        [InlineKeyboardButton("История расчётов", callback_data='history')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(
-        "Выбери нужный расчет:", reply_markup=reply_markup
-    )
-    return MENU
 
-# --- Break-even point handlers ---
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Explain what the bot does and list its commands."""
+    if update.message:
+        await update.message.reply_text(
+            "Я считаю микроэкономические показатели.\n\n"
+            "Команды:\n"
+            "/start — главное меню\n"
+            "/help — эта справка\n"
+            "/cancel — отменить текущий расчёт\n\n"
+            "Выбери расчёт кнопками в меню и следуй подсказкам."
+        )
 
-async def break_even_start(update: Update, context) -> int:
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the current calculation and end the conversation."""
+    if update.message:
+        await update.message.reply_text("Расчёт отменён. Набери /start, чтобы вернуться в меню.")
+    elif update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        await safe_edit(query, "Расчёт отменён. Набери /start, чтобы вернуться в меню.")
+    return ConversationHandler.END
+
+
+# --------------------------------------------------------------------------- #
+# Break-even handlers                                                         #
+# --------------------------------------------------------------------------- #
+
+
+async def break_even_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data["current_calculation"] = "Точка безубыточности"
     await query.edit_message_text("Введите постоянные издержки:")
     return BREAK_EVEN_FIXED_COSTS
 
-async def break_even_fixed_costs(update: Update, context) -> int:
+
+async def break_even_fixed_costs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["fixed_costs"] = float(update.message.text)
-        await update.message.reply_text("Введите переменные издержки на единицу продукции:")
-        return BREAK_EVEN_VARIABLE_COST
+        context.user_data["fixed_costs"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return BREAK_EVEN_FIXED_COSTS
+    await update.message.reply_text("Введите переменные издержки на единицу продукции:")
+    return BREAK_EVEN_VARIABLE_COST
 
-async def break_even_variable_cost(update: Update, context) -> int:
+
+async def break_even_variable_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["variable_cost_per_unit"] = float(update.message.text)
-        await update.message.reply_text("Введите цену за единицу продукции:")
-        return BREAK_EVEN_PRICE
+        context.user_data["variable_cost_per_unit"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return BREAK_EVEN_VARIABLE_COST
+    await update.message.reply_text("Введите цену за единицу продукции:")
+    return BREAK_EVEN_PRICE
 
-async def break_even_price(update: Update, context) -> int:
+
+async def break_even_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["price_per_unit"] = float(update.message.text)
-        fixed_costs = context.user_data["fixed_costs"]
-        variable_cost_per_unit = context.user_data["variable_cost_per_unit"]
-        price_per_unit = context.user_data["price_per_unit"]
-
-        units, revenue = calculate_break_even(fixed_costs, variable_cost_per_unit, price_per_unit)
-
-        if units is None:
-            await update.message.reply_text(
-                "Ошибка: Цена за единицу должна быть больше переменных издержек на единицу продукции. "
-                "Пожалуйста, попробуйте снова."
-            )
-            return BREAK_EVEN_FIXED_COSTS # Restart the calculation
-
-        explanation = (
-            f"Это означает, что вам нужно продать минимум {units:.2f} единиц, чтобы покрыть все расходы. "
-            f"Всё, что продано сверх этого — ваша прибыль."
-        )
-        result_text = (
-            f"Точка безубыточности:\n"\
-            f"В единицах: {units:.2f}\n"\
-            f"В выручке: {revenue:.2f}\n\n"\
-            f"{explanation}"
-        )
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        context.user_data["history"].append(f"[{timestamp}] {context.user_data["current_calculation"]}: {result_text}")
-        keyboard = [[InlineKeyboardButton("Главное меню", callback_data='main_menu')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return MENU
+        price_per_unit = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return BREAK_EVEN_PRICE
 
-# --- Margin handlers ---
+    units, revenue = calculate_break_even(
+        context.user_data["fixed_costs"], context.user_data["variable_cost_per_unit"], price_per_unit
+    )
+    if units is None:
+        await update.message.reply_text(
+            "Ошибка: Цена за единицу должна быть больше переменных издержек на единицу продукции. "
+            "Пожалуйста, попробуйте снова."
+        )
+        return BREAK_EVEN_FIXED_COSTS  # restart the calculation
 
-async def margin_start(update: Update, context) -> int:
+    explanation = (
+        f"Это означает, что вам нужно продать минимум {units:.2f} единиц, чтобы покрыть все расходы. "
+        f"Всё, что продано сверх этого — ваша прибыль."
+    )
+    result_text = (
+        f"Точка безубыточности:\n"
+        f"В единицах: {units:.2f}\n"
+        f"В выручке: {revenue:.2f}\n\n{explanation}"
+    )
+    record_result(context, result_text)
+    await send_long_message(update, result_text, reply_markup=result_markup())
+    return MENU
+
+
+# --------------------------------------------------------------------------- #
+# Margin handlers                                                             #
+# --------------------------------------------------------------------------- #
+
+
+async def margin_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data["current_calculation"] = "Маржинальность"
     await query.edit_message_text("Введите выручку:")
     return MARGIN_REVENUE
 
-async def margin_revenue(update: Update, context) -> int:
+
+async def margin_revenue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["revenue"] = float(update.message.text)
-        await update.message.reply_text("Введите себестоимость товаров:")
-        return MARGIN_COST_OF_GOODS
+        context.user_data["revenue"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return MARGIN_REVENUE
+    await update.message.reply_text("Введите себестоимость товаров:")
+    return MARGIN_COST_OF_GOODS
 
-async def margin_cost_of_goods(update: Update, context) -> int:
+
+async def margin_cost_of_goods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["cost_of_goods"] = float(update.message.text)
-        revenue = context.user_data["revenue"]
-        cost_of_goods = context.user_data["cost_of_goods"]
-
-        absolute_margin, percentage_margin = calculate_margin(revenue, cost_of_goods)
-
-        if absolute_margin is None:
-            await update.message.reply_text(
-                "Ошибка: Выручка не может быть равна нулю. Пожалуйста, попробуйте снова."
-            )
-            return MARGIN_REVENUE # Restart the calculation
-
-        explanation = ""
-        if percentage_margin >= 50:
-            explanation = "Это отличный показатель, указывающий на высокую прибыльность вашего продукта или услуги."
-        elif percentage_margin >= 20:
-            explanation = "Это хороший показатель, свидетельствующий о здоровой прибыльности."
-        else:
-            explanation = "Это низкий показатель, возможно, стоит пересмотреть ценообразование или издержки."
-
-        result_text = (
-            f"Маржинальность:\n"\
-            f"Абсолютное значение: {absolute_margin:.2f}\n"\
-            f"В процентах: {percentage_margin:.2f}%\n\n"\
-            f"{explanation}"
-        )
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        context.user_data["history"].append(f"[{timestamp}] {context.user_data["current_calculation"]}: {result_text}")
-        keyboard = [[InlineKeyboardButton("Главное меню", callback_data='main_menu')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return MENU
+        cost_of_goods = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return MARGIN_COST_OF_GOODS
 
-# --- ROI handlers ---
+    absolute_margin, percentage_margin = calculate_margin(context.user_data["revenue"], cost_of_goods)
+    if absolute_margin is None:
+        await update.message.reply_text(
+            "Ошибка: Выручка не может быть равна нулю. Пожалуйста, попробуйте снова."
+        )
+        return MARGIN_REVENUE  # restart the calculation
 
-async def roi_start(update: Update, context) -> int:
+    if percentage_margin >= 50:
+        explanation = "Это отличный показатель, указывающий на высокую прибыльность вашего продукта или услуги."
+    elif percentage_margin >= 20:
+        explanation = "Это хороший показатель, свидетельствующий о здоровой прибыльности."
+    else:
+        explanation = "Это низкий показатель, возможно, стоит пересмотреть ценообразование или издержки."
+
+    result_text = (
+        f"Маржинальность:\n"
+        f"Абсолютное значение: {absolute_margin:.2f}\n"
+        f"В процентах: {percentage_margin:.2f}%\n\n{explanation}"
+    )
+    record_result(context, result_text)
+    await send_long_message(update, result_text, reply_markup=result_markup())
+    return MENU
+
+
+# --------------------------------------------------------------------------- #
+# ROI handlers                                                                #
+# --------------------------------------------------------------------------- #
+
+
+async def roi_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data["current_calculation"] = "ROI"
     await query.edit_message_text("Введите прибыль от инвестиций:")
     return ROI_PROFIT
 
-async def roi_profit(update: Update, context) -> int:
+
+async def roi_profit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["profit_from_investment"] = float(update.message.text)
-        await update.message.reply_text("Введите стоимость инвестиций:")
-        return ROI_COST
+        context.user_data["profit_from_investment"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return ROI_PROFIT
+    await update.message.reply_text("Введите стоимость инвестиций:")
+    return ROI_COST
 
-async def roi_cost(update: Update, context) -> int:
+
+async def roi_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["cost_of_investment"] = float(update.message.text)
-        profit_from_investment = context.user_data["profit_from_investment"]
-        cost_of_investment = context.user_data["cost_of_investment"]
-
-        roi = calculate_roi(profit_from_investment, cost_of_investment)
-
-        if roi is None:
-            await update.message.reply_text(
-                "Ошибка: Стоимость инвестиций не может быть равна нулю. Пожалуйста, попробуйте снова."
-            )
-            return ROI_PROFIT # Restart the calculation
-
-        explanation = ""
-        if roi >= 100:
-            explanation = f"ROI {roi:.2f}% означает, что на каждый вложенный рубль вы получаете {1 + roi/100:.2f} руб. чистой прибыли. Это отличный показатель."
-        elif roi >= 0:
-            explanation = f"ROI {roi:.2f}% означает, что на каждый вложенный рубль вы получаете {1 + roi/100:.2f} руб. чистой прибыли. Это хороший показатель."
-        else:
-            explanation = f"Отрицательный ROI {roi:.2f}% означает, что ваши инвестиции убыточны. Возможно, стоит пересмотреть стратегию."
-
-        result_text = f"ROI: {roi:.2f}%\n\n{explanation}"
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        context.user_data["history"].append(f"[{timestamp}] {context.user_data["current_calculation"]}: {result_text}")
-        keyboard = [[InlineKeyboardButton("Главное меню", callback_data='main_menu')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return MENU
+        cost_of_investment = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return ROI_COST
 
-# --- Unit Cost handlers ---
+    roi = calculate_roi(context.user_data["profit_from_investment"], cost_of_investment)
+    if roi is None:
+        await update.message.reply_text(
+            "Ошибка: Стоимость инвестиций не может быть равна нулю. Пожалуйста, попробуйте снова."
+        )
+        return ROI_PROFIT  # restart the calculation
 
-async def unit_cost_start(update: Update, context) -> int:
+    if roi >= 0:
+        quality = "отличный" if roi >= 100 else "хороший"
+        explanation = (
+            f"ROI {roi:.2f}% означает, что на каждый вложенный рубль вы получаете "
+            f"{1 + roi / 100:.2f} руб. вместе с вложением. Это {quality} показатель."
+        )
+    else:
+        explanation = (
+            f"Отрицательный ROI {roi:.2f}% означает, что ваши инвестиции убыточны. "
+            f"Возможно, стоит пересмотреть стратегию."
+        )
+
+    result_text = f"ROI: {roi:.2f}%\n\n{explanation}"
+    record_result(context, result_text)
+    await send_long_message(update, result_text, reply_markup=result_markup())
+    return MENU
+
+
+# --------------------------------------------------------------------------- #
+# Unit-cost handlers                                                          #
+# --------------------------------------------------------------------------- #
+
+
+async def unit_cost_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data["current_calculation"] = "Себестоимость единицы продукции"
     await query.edit_message_text("Введите общие постоянные издержки:")
     return UNIT_COST_FIXED_COSTS
 
-async def unit_cost_fixed_costs(update: Update, context) -> int:
+
+async def unit_cost_fixed_costs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["total_fixed_costs"] = float(update.message.text)
-        await update.message.reply_text("Введите общие переменные издержки:")
-        return UNIT_COST_VARIABLE_COSTS
+        context.user_data["total_fixed_costs"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return UNIT_COST_FIXED_COSTS
+    await update.message.reply_text("Введите общие переменные издержки:")
+    return UNIT_COST_VARIABLE_COSTS
 
-async def unit_cost_variable_costs(update: Update, context) -> int:
+
+async def unit_cost_variable_costs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["total_variable_costs"] = float(update.message.text)
-        await update.message.reply_text("Введите количество произведенных единиц:")
-        return UNIT_COST_UNITS
+        context.user_data["total_variable_costs"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return UNIT_COST_VARIABLE_COSTS
+    await update.message.reply_text("Введите количество произведенных единиц:")
+    return UNIT_COST_UNITS
 
-async def unit_cost_units(update: Update, context) -> int:
+
+async def unit_cost_units(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["number_of_units"] = float(update.message.text)
-        total_fixed_costs = context.user_data["total_fixed_costs"]
-        total_variable_costs = context.user_data["total_variable_costs"]
-        number_of_units = context.user_data["number_of_units"]
-
-        unit_cost = calculate_unit_cost(total_fixed_costs, total_variable_costs, number_of_units)
-
-        if unit_cost is None:
-            await update.message.reply_text(
-                "Ошибка: Количество произведенных единиц не может быть равно нулю. Пожалуйста, попробуйте снова."
-            )
-            return UNIT_COST_FIXED_COSTS # Restart the calculation
-
-        explanation = (
-            f"Это средняя стоимость производства одной единицы продукции. "
-            f"Важно, чтобы цена продажи была выше этой цифры для получения прибыли."
-        )
-        result_text = f"Себестоимость единицы продукции: {unit_cost:.2f}\n\n{explanation}"
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        context.user_data["history"].append(f"[{timestamp}] {context.user_data["current_calculation"]}: {result_text}")
-        keyboard = [[InlineKeyboardButton("Главное меню", callback_data='main_menu')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return MENU
+        number_of_units = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return UNIT_COST_UNITS
 
-# --- Elasticity handlers ---
+    unit_cost = calculate_unit_cost(
+        context.user_data["total_fixed_costs"],
+        context.user_data["total_variable_costs"],
+        number_of_units,
+    )
+    if unit_cost is None:
+        await update.message.reply_text(
+            "Ошибка: Количество произведенных единиц не может быть равно нулю. "
+            "Пожалуйста, попробуйте снова."
+        )
+        return UNIT_COST_FIXED_COSTS  # restart the calculation
 
-async def elasticity_start(update: Update, context) -> int:
+    explanation = (
+        "Это средняя стоимость производства одной единицы продукции. "
+        "Важно, чтобы цена продажи была выше этой цифры для получения прибыли."
+    )
+    result_text = f"Себестоимость единицы продукции: {unit_cost:.2f}\n\n{explanation}"
+    record_result(context, result_text)
+    await send_long_message(update, result_text, reply_markup=result_markup())
+    return MENU
+
+
+# --------------------------------------------------------------------------- #
+# Elasticity handlers                                                         #
+# --------------------------------------------------------------------------- #
+
+
+async def elasticity_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data["current_calculation"] = "Эластичность спроса"
-    await query.edit_message_text("Введите процентное изменение спроса (например, -10 для снижения на 10%):")
+    await query.edit_message_text(
+        "Введите процентное изменение спроса (например, -10 для снижения на 10%):"
+    )
     return ELASTICITY_QUANTITY_CHANGE
 
-async def elasticity_quantity_change(update: Update, context) -> int:
+
+async def elasticity_quantity_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["quantity_change"] = float(update.message.text)
-        await update.message.reply_text("Введите процентное изменение цены (например, 5 для роста на 5%):")
-        return ELASTICITY_PRICE_CHANGE
+        context.user_data["quantity_change"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return ELASTICITY_QUANTITY_CHANGE
+    await update.message.reply_text(
+        "Введите процентное изменение цены (например, 5 для роста на 5%):"
+    )
+    return ELASTICITY_PRICE_CHANGE
 
-async def elasticity_price_change(update: Update, context) -> int:
+
+async def elasticity_price_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["price_change"] = float(update.message.text)
-        quantity_change = context.user_data["quantity_change"]
-        price_change = context.user_data["price_change"]
-
-        elasticity, interpretation = calculate_elasticity(quantity_change, price_change)
-
-        if elasticity is None:
-            await update.message.reply_text(
-                f"Ошибка: {interpretation} Пожалуйста, попробуйте снова."
-            )
-            return ELASTICITY_QUANTITY_CHANGE # Restart the calculation
-
-        explanation = ""
-        if elasticity < -1:
-            explanation = "Спрос эластичен. Небольшое изменение цены приведет к значительному изменению спроса. Возможно, стоит рассмотреть снижение цены для увеличения общего дохода."
-        elif elasticity > -1 and elasticity < 0:
-            explanation = "Спрос неэластичен. Изменение цены не сильно повлияет на спрос. Вы можете рассмотреть возможность повышения цены без существенной потери клиентов."
-        elif elasticity == -1:
-            explanation = "Единичная эластичность. Изменение цены приведет к пропорциональному изменению спроса. Общий доход останется прежним."
-        elif elasticity == 0:
-            explanation = "Спрос совершенно неэластичен. Изменение цены не повлияет на спрос. Это редкий случай для товаров первой необходимости."
-        elif elasticity > 0:
-            explanation = "Товар Гиффена или Веблена. Спрос растет с ростом цены. Это очень редкий случай, характерный для предметов роскоши или низкокачественных товаров в определенных условиях."
-
-        result_text = (
-            f"Эластичность спроса:\n"\
-            f"Коэффициент: {elasticity:.2f}\n"\
-            f"Интерпретация: {interpretation}\n\n"\
-            f"{explanation}"
-        )
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        context.user_data["history"].append(f"[{timestamp}] {context.user_data["current_calculation"]}: {result_text}")
-        keyboard = [[InlineKeyboardButton("Главное меню", callback_data='main_menu')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return MENU
+        price_change = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return ELASTICITY_PRICE_CHANGE
 
-# --- Profit/Loss handlers ---
+    elasticity, interpretation = calculate_elasticity(
+        context.user_data["quantity_change"], price_change
+    )
+    if elasticity is None:
+        await update.message.reply_text(f"Ошибка: {interpretation} Пожалуйста, попробуйте снова.")
+        return ELASTICITY_QUANTITY_CHANGE  # restart the calculation
 
-async def profit_loss_start(update: Update, context) -> int:
+    if elasticity < -1:
+        explanation = (
+            "Спрос эластичен. Небольшое изменение цены приведет к значительному изменению спроса. "
+            "Возможно, стоит рассмотреть снижение цены для увеличения общего дохода."
+        )
+    elif -1 < elasticity < 0:
+        explanation = (
+            "Спрос неэластичен. Изменение цены не сильно повлияет на спрос. "
+            "Вы можете рассмотреть возможность повышения цены без существенной потери клиентов."
+        )
+    elif elasticity == -1:
+        explanation = (
+            "Единичная эластичность. Изменение цены приведет к пропорциональному изменению спроса. "
+            "Общий доход останется прежним."
+        )
+    elif elasticity == 0:
+        explanation = (
+            "Спрос совершенно неэластичен. Изменение цены не повлияет на спрос. "
+            "Это редкий случай для товаров первой необходимости."
+        )
+    else:
+        explanation = (
+            "Товар Гиффена или Веблена. Спрос растет с ростом цены. Это очень редкий случай, "
+            "характерный для предметов роскоши или низкокачественных товаров в определенных условиях."
+        )
+
+    result_text = (
+        f"Эластичность спроса:\n"
+        f"Коэффициент: {elasticity:.2f}\n"
+        f"Интерпретация: {interpretation}\n\n{explanation}"
+    )
+    record_result(context, result_text)
+    await send_long_message(update, result_text, reply_markup=result_markup())
+    return MENU
+
+
+# --------------------------------------------------------------------------- #
+# Profit/loss handlers                                                        #
+# --------------------------------------------------------------------------- #
+
+
+async def profit_loss_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data["current_calculation"] = "Прибыль/убыток"
     await query.edit_message_text("Введите общую выручку:")
     return PROFIT_LOSS_REVENUE
 
-async def profit_loss_revenue(update: Update, context) -> int:
+
+async def profit_loss_revenue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["total_revenue"] = float(update.message.text)
-        await update.message.reply_text("Введите общие затраты:")
-        return PROFIT_LOSS_COSTS
+        context.user_data["total_revenue"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return PROFIT_LOSS_REVENUE
+    await update.message.reply_text("Введите общие затраты:")
+    return PROFIT_LOSS_COSTS
 
-async def profit_loss_costs(update: Update, context) -> int:
+
+async def profit_loss_costs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["total_costs"] = float(update.message.text)
-        total_revenue = context.user_data["total_revenue"]
-        total_costs = context.user_data["total_costs"]
-
-        profit_loss, status = calculate_profit_loss(total_revenue, total_costs)
-
-        explanation = ""
-        if profit_loss > 0:
-            explanation = f"Ваш бизнес получил прибыль в размере {profit_loss:.2f}. Это хороший результат, показывающий эффективность вашей деятельности."
-        elif profit_loss < 0:
-            explanation = f"Ваш бизнес понес убытки в размере {abs(profit_loss):.2f}. Необходимо проанализировать доходы и расходы для улучшения ситуации."
-        else:
-            explanation = "Ваш бизнес вышел в ноль. Доходы равны расходам. Для роста необходимо увеличивать выручку или сокращать издержки."
-
-        result_text = (
-            f"Прибыль/убыток:\n"\
-            f"Сумма: {profit_loss:.2f}\n"\
-            f"Статус: {status}\n\n"\
-            f"{explanation}"
-        )
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        context.user_data["history"].append(f"[{timestamp}] {context.user_data["current_calculation"]}: {result_text}")
-        keyboard = [[InlineKeyboardButton("Главное меню", callback_data='main_menu')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return MENU
+        total_costs = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return PROFIT_LOSS_COSTS
 
-# --- Average and Marginal Costs handlers ---
+    profit_loss, status = calculate_profit_loss(context.user_data["total_revenue"], total_costs)
 
-async def avg_marginal_costs_start(update: Update, context) -> int:
+    if profit_loss > 0:
+        explanation = (
+            f"Ваш бизнес получил прибыль в размере {profit_loss:.2f}. Это хороший результат, "
+            f"показывающий эффективность вашей деятельности."
+        )
+    elif profit_loss < 0:
+        explanation = (
+            f"Ваш бизнес понес убытки в размере {abs(profit_loss):.2f}. Необходимо проанализировать "
+            f"доходы и расходы для улучшения ситуации."
+        )
+    else:
+        explanation = (
+            "Ваш бизнес вышел в ноль. Доходы равны расходам. Для роста необходимо увеличивать "
+            "выручку или сокращать издержки."
+        )
+
+    result_text = (
+        f"Прибыль/убыток:\n"
+        f"Сумма: {profit_loss:.2f}\n"
+        f"Статус: {status}\n\n{explanation}"
+    )
+    record_result(context, result_text)
+    await send_long_message(update, result_text, reply_markup=result_markup())
+    return MENU
+
+
+# --------------------------------------------------------------------------- #
+# Average & marginal cost handlers                                            #
+# --------------------------------------------------------------------------- #
+
+
+async def avg_marginal_costs_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data["current_calculation"] = "Средние и предельные издержки"
     await query.edit_message_text("Введите общие издержки при текущем объеме производства:")
     return AVG_MARGINAL_COST_CURRENT_TOTAL_COST
 
-async def avg_marginal_costs_current_total_cost(update: Update, context) -> int:
+
+async def avg_marginal_costs_current_total_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["current_total_cost"] = float(update.message.text)
-        await update.message.reply_text("Введите общие издержки при предыдущем объеме производства:")
-        return AVG_MARGINAL_COST_PREVIOUS_TOTAL_COST
+        context.user_data["current_total_cost"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return AVG_MARGINAL_COST_CURRENT_TOTAL_COST
+    await update.message.reply_text("Введите общие издержки при предыдущем объеме производства:")
+    return AVG_MARGINAL_COST_PREVIOUS_TOTAL_COST
 
-async def avg_marginal_costs_previous_total_cost(update: Update, context) -> int:
+
+async def avg_marginal_costs_previous_total_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["previous_total_cost"] = float(update.message.text)
-        await update.message.reply_text("Введите текущее количество произведенных единиц:")
-        return AVG_MARGINAL_COST_CURRENT_QUANTITY
+        context.user_data["previous_total_cost"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return AVG_MARGINAL_COST_PREVIOUS_TOTAL_COST
+    await update.message.reply_text("Введите текущее количество произведенных единиц:")
+    return AVG_MARGINAL_COST_CURRENT_QUANTITY
 
-async def avg_marginal_costs_current_quantity(update: Update, context) -> int:
+
+async def avg_marginal_costs_current_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["current_quantity"] = float(update.message.text)
-        await update.message.reply_text("Введите предыдущее количество произведенных единиц:")
-        return AVG_MARGINAL_COST_PREVIOUS_QUANTITY
+        context.user_data["current_quantity"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return AVG_MARGINAL_COST_CURRENT_QUANTITY
+    await update.message.reply_text("Введите предыдущее количество произведенных единиц:")
+    return AVG_MARGINAL_COST_PREVIOUS_QUANTITY
 
-async def avg_marginal_costs_previous_quantity(update: Update, context) -> int:
+
+async def avg_marginal_costs_previous_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["previous_quantity"] = float(update.message.text)
-        current_total_cost = context.user_data["current_total_cost"]
-        previous_total_cost = context.user_data["previous_total_cost"]
-        current_quantity = context.user_data["current_quantity"]
-        previous_quantity = context.user_data["previous_quantity"]
-
-        avg_cost, marginal_cost = calculate_avg_marginal_costs(
-            current_total_cost, previous_total_cost, current_quantity, previous_quantity
-        )
-
-        if avg_cost is None:
-            await update.message.reply_text(
-                "Ошибка: Текущее количество произведенных единиц не может быть равно нулю. Пожалуйста, попробуйте снова."
-            )
-            return AVG_MARGINAL_COST_CURRENT_TOTAL_COST # Restart the calculation
-
-        if marginal_cost is None:
-            await update.message.reply_text(
-                "Ошибка: Изменение количества произведенных единиц не может быть равно нулю. Пожалуйста, попробуйте снова."
-            )
-            return AVG_MARGINAL_COST_CURRENT_TOTAL_COST # Restart the calculation
-
-        explanation = (
-            f"Средние издержки показывают стоимость одной единицы продукции в среднем. "
-            f"Предельные издержки показывают, сколько стоит производство дополнительной единицы. "
-            f"Сравнение этих показателей помогает оптимизировать производство."
-        )
-        result_text = (
-            f"Средние издержки: {avg_cost:.2f}\n"\
-            f"Предельные издержки: {marginal_cost:.2f}\n\n"\
-            f"{explanation}"
-        )
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        context.user_data["history"].append(f"[{timestamp}] {context.user_data["current_calculation"]}: {result_text}")
-        keyboard = [[InlineKeyboardButton("Главное меню", callback_data='main_menu')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return MENU
+        previous_quantity = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return AVG_MARGINAL_COST_PREVIOUS_QUANTITY
 
-# --- Markup and Discount handlers ---
+    avg_cost, marginal_cost = calculate_avg_marginal_costs(
+        context.user_data["current_total_cost"],
+        context.user_data["previous_total_cost"],
+        context.user_data["current_quantity"],
+        previous_quantity,
+    )
+    if avg_cost is None:
+        await update.message.reply_text(
+            "Ошибка: Текущее количество произведенных единиц не может быть равно нулю. "
+            "Пожалуйста, попробуйте снова."
+        )
+        return AVG_MARGINAL_COST_CURRENT_TOTAL_COST  # restart the calculation
+    if marginal_cost is None:
+        await update.message.reply_text(
+            "Ошибка: Изменение количества произведенных единиц не может быть равно нулю. "
+            "Пожалуйста, попробуйте снова."
+        )
+        return AVG_MARGINAL_COST_CURRENT_TOTAL_COST  # restart the calculation
 
-async def markup_discount_start(update: Update, context) -> int:
+    explanation = (
+        "Средние издержки показывают стоимость одной единицы продукции в среднем. "
+        "Предельные издержки показывают, сколько стоит производство дополнительной единицы. "
+        "Сравнение этих показателей помогает оптимизировать производство."
+    )
+    result_text = (
+        f"Средние издержки: {avg_cost:.2f}\n"
+        f"Предельные издержки: {marginal_cost:.2f}\n\n{explanation}"
+    )
+    record_result(context, result_text)
+    await send_long_message(update, result_text, reply_markup=result_markup())
+    return MENU
+
+
+# --------------------------------------------------------------------------- #
+# Markup / discount handlers                                                  #
+# --------------------------------------------------------------------------- #
+
+
+async def markup_discount_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data["current_calculation"] = "Наценка и скидка"
-    keyboard = [
-        [InlineKeyboardButton("Наценка", callback_data='markup')],
-        [InlineKeyboardButton("Скидка", callback_data='discount')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text("Выберите тип операции:", reply_markup=reply_markup)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Наценка", callback_data="markup")],
+        [InlineKeyboardButton("Скидка", callback_data="discount")],
+    ])
+    await query.edit_message_text("Выберите тип операции:", reply_markup=keyboard)
     return MARKUP_DISCOUNT_TYPE
 
-async def markup_discount_type(update: Update, context) -> int:
+
+async def markup_discount_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    context.user_data["is_discount"] = (query.data == 'discount')
+    context.user_data["is_discount"] = query.data == "discount"
     await query.edit_message_text("Введите базовую цену:")
     return MARKUP_DISCOUNT_PRICE
 
-async def markup_discount_price(update: Update, context) -> int:
+
+async def markup_discount_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["base_price"] = float(update.message.text)
-        await update.message.reply_text("Введите процент (например, 20 для 20%):")
-        return MARKUP_DISCOUNT_PERCENTAGE
+        context.user_data["base_price"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return MARKUP_DISCOUNT_PRICE
+    await update.message.reply_text("Введите процент (например, 20 для 20%):")
+    return MARKUP_DISCOUNT_PERCENTAGE
 
-async def markup_discount_percentage(update: Update, context) -> int:
+
+async def markup_discount_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["percentage"] = float(update.message.text)
-        base_price = context.user_data["base_price"]
-        percentage = context.user_data["percentage"]
-        is_discount = context.user_data["is_discount"]
-
-        new_price = calculate_markup_discount(base_price, percentage, is_discount)
-
-        operation_type = "скидка" if is_discount else "наценка"
-        explanation = (
-            f"После {operation_type} в {percentage:.2f}% от базовой цены {base_price:.2f}, "
-            f"новая цена составит {new_price:.2f}. "
-            f"Это позволяет вам гибко управлять ценообразованием."
-        )
-        result_text = f"Новая цена после {operation_type}: {new_price:.2f}\n\n{explanation}"
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        context.user_data["history"].append(f"[{timestamp}] {context.user_data["current_calculation"]}: {result_text}")
-        keyboard = [[InlineKeyboardButton("Главное меню", callback_data='main_menu')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return MENU
+        percentage = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return MARKUP_DISCOUNT_PERCENTAGE
+    base_price = context.user_data["base_price"]
+    is_discount = context.user_data["is_discount"]
 
-# --- Payback Period handlers ---
+    new_price = calculate_markup_discount(base_price, percentage, is_discount)
+    operation_type = "скидка" if is_discount else "наценка"
+    explanation = (
+        f"После {operation_type} в {percentage:.2f}% от базовой цены {base_price:.2f}, "
+        f"новая цена составит {new_price:.2f}. "
+        f"Это позволяет вам гибко управлять ценообразованием."
+    )
+    result_text = f"Новая цена после {operation_type}: {new_price:.2f}\n\n{explanation}"
+    record_result(context, result_text)
+    await send_long_message(update, result_text, reply_markup=result_markup())
+    return MENU
 
-async def payback_period_start(update: Update, context) -> int:
+
+# --------------------------------------------------------------------------- #
+# Payback-period handlers                                                     #
+# --------------------------------------------------------------------------- #
+
+
+async def payback_period_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data["current_calculation"] = "Срок окупаемости"
     await query.edit_message_text("Введите начальные инвестиции:")
     return PAYBACK_INVESTMENT
 
-async def payback_investment(update: Update, context) -> int:
+
+async def payback_investment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["initial_investment"] = float(update.message.text)
-        await update.message.reply_text("Введите годовой денежный поток:")
-        return PAYBACK_CASH_FLOW
+        context.user_data["initial_investment"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return PAYBACK_INVESTMENT
+    await update.message.reply_text("Введите годовой денежный поток:")
+    return PAYBACK_CASH_FLOW
 
-async def payback_cash_flow(update: Update, context) -> int:
+
+async def payback_cash_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["annual_cash_flow"] = float(update.message.text)
-        initial_investment = context.user_data["initial_investment"]
-        annual_cash_flow = context.user_data["annual_cash_flow"]
-
-        years, months = calculate_payback_period(initial_investment, annual_cash_flow)
-
-        if years is None:
-            await update.message.reply_text(
-                "Ошибка: Годовой денежный поток должен быть положительным. Пожалуйста, попробуйте снова."
-            )
-            return PAYBACK_INVESTMENT # Restart the calculation
-
-        explanation = (
-            f"Ваши инвестиции окупятся примерно через {years} лет и {months} месяцев. "
-            f"Чем короче срок окупаемости, тем быстрее вы вернете вложенные средства."
-        )
-        result_text = f"Срок окупаемости: {years} лет и {months} месяцев\n\n{explanation}"
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        context.user_data["history"].append(f"[{timestamp}] {context.user_data["current_calculation"]}: {result_text}")
-        keyboard = [[InlineKeyboardButton("Главное меню", callback_data='main_menu')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return MENU
+        annual_cash_flow = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return PAYBACK_CASH_FLOW
 
-# --- Operating Leverage handlers ---
+    years, months = calculate_payback_period(context.user_data["initial_investment"], annual_cash_flow)
+    if years is None:
+        await update.message.reply_text(
+            "Ошибка: Годовой денежный поток должен быть положительным. Пожалуйста, попробуйте снова."
+        )
+        return PAYBACK_INVESTMENT  # restart the calculation
 
-async def operating_leverage_start(update: Update, context) -> int:
+    explanation = (
+        f"Ваши инвестиции окупятся примерно через {years} лет и {months} месяцев. "
+        f"Чем короче срок окупаемости, тем быстрее вы вернете вложенные средства."
+    )
+    result_text = f"Срок окупаемости: {years} лет и {months} месяцев\n\n{explanation}"
+    record_result(context, result_text)
+    await send_long_message(update, result_text, reply_markup=result_markup())
+    return MENU
+
+
+# --------------------------------------------------------------------------- #
+# Operating-leverage handlers                                                 #
+# --------------------------------------------------------------------------- #
+
+
+async def operating_leverage_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data["current_calculation"] = "Операционный рычаг"
     await query.edit_message_text("Введите общую выручку:")
     return OPERATING_LEVERAGE_REVENUE
 
-async def operating_leverage_revenue(update: Update, context) -> int:
+
+async def operating_leverage_revenue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["total_revenue"] = float(update.message.text)
-        await update.message.reply_text("Введите переменные издержки:")
-        return OPERATING_LEVERAGE_VARIABLE_COSTS
+        context.user_data["total_revenue"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return OPERATING_LEVERAGE_REVENUE
+    await update.message.reply_text("Введите переменные издержки:")
+    return OPERATING_LEVERAGE_VARIABLE_COSTS
 
-async def operating_leverage_variable_costs(update: Update, context) -> int:
+
+async def operating_leverage_variable_costs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["variable_costs"] = float(update.message.text)
-        await update.message.reply_text("Введите постоянные издержки:")
-        return OPERATING_LEVERAGE_FIXED_COSTS
+        context.user_data["variable_costs"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return OPERATING_LEVERAGE_VARIABLE_COSTS
+    await update.message.reply_text("Введите постоянные издержки:")
+    return OPERATING_LEVERAGE_FIXED_COSTS
 
-async def operating_leverage_fixed_costs(update: Update, context) -> int:
+
+async def operating_leverage_fixed_costs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["fixed_costs"] = float(update.message.text)
-        total_revenue = context.user_data["total_revenue"]
-        variable_costs = context.user_data["variable_costs"]
-        fixed_costs = context.user_data["fixed_costs"]
-
-        operating_leverage = calculate_operating_leverage(total_revenue, variable_costs, fixed_costs)
-
-        if operating_leverage is None:
-            await update.message.reply_text(
-                "Ошибка: Невозможно рассчитать операционный рычаг. Убедитесь, что выручка больше переменных издержек, а операционная прибыль не равна нулю. Пожалуйста, попробуйте снова."
-            )
-            return OPERATING_LEVERAGE_REVENUE # Restart the calculation
-
-        explanation = ""
-        if operating_leverage > 2:
-            explanation = "Высокий операционный рычаг. Это означает, что небольшое изменение выручки приведет к значительному изменению операционной прибыли. Высокий риск, но и высокий потенциал роста."
-        elif operating_leverage > 1:
-            explanation = "Умеренный операционный рычаг. Есть чувствительность к изменениям выручки, но риски управляемы."
-        else:
-            explanation = "Низкий операционный рычаг. Это указывает на стабильность прибыли при изменениях выручки, но и на меньший потенциал для быстрого роста."
-
-        result_text = f"Операционный рычаг: {operating_leverage:.2f}\n\n{explanation}"
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        context.user_data["history"].append(f"[{timestamp}] {context.user_data["current_calculation"]}: {result_text}")
-        keyboard = [[InlineKeyboardButton("Главное меню", callback_data='main_menu')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return MENU
+        fixed_costs = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return OPERATING_LEVERAGE_FIXED_COSTS
 
-# --- NPV handlers ---
+    operating_leverage = calculate_operating_leverage(
+        context.user_data["total_revenue"], context.user_data["variable_costs"], fixed_costs
+    )
+    if operating_leverage is None:
+        await update.message.reply_text(
+            "Ошибка: Невозможно рассчитать операционный рычаг. Убедитесь, что выручка больше "
+            "переменных издержек, а операционная прибыль не равна нулю. Пожалуйста, попробуйте снова."
+        )
+        return OPERATING_LEVERAGE_REVENUE  # restart the calculation
 
-async def npv_start(update: Update, context) -> int:
+    if operating_leverage > 2:
+        explanation = (
+            "Высокий операционный рычаг. Это означает, что небольшое изменение выручки приведет "
+            "к значительному изменению операционной прибыли. Высокий риск, но и высокий потенциал роста."
+        )
+    elif operating_leverage > 1:
+        explanation = (
+            "Умеренный операционный рычаг. Есть чувствительность к изменениям выручки, "
+            "но риски управляемы."
+        )
+    else:
+        explanation = (
+            "Низкий операционный рычаг. Это указывает на стабильность прибыли при изменениях "
+            "выручки, но и на меньший потенциал для быстрого роста."
+        )
+
+    result_text = f"Операционный рычаг: {operating_leverage:.2f}\n\n{explanation}"
+    record_result(context, result_text)
+    await send_long_message(update, result_text, reply_markup=result_markup())
+    return MENU
+
+
+# --------------------------------------------------------------------------- #
+# NPV handlers                                                                #
+# --------------------------------------------------------------------------- #
+
+
+async def npv_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data["current_calculation"] = "Расчёт NPV"
     await query.edit_message_text("Введите начальные инвестиции:")
     return NPV_INITIAL_INVESTMENT
 
-async def npv_initial_investment(update: Update, context) -> int:
+
+async def npv_initial_investment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["initial_investment"] = float(update.message.text)
-        await update.message.reply_text("Введите денежный поток за первый год:")
-        return NPV_CASH_FLOW_YEAR1
+        context.user_data["initial_investment"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return NPV_INITIAL_INVESTMENT
+    await update.message.reply_text("Введите денежный поток за первый год:")
+    return NPV_CASH_FLOW_YEAR1
 
-async def npv_cash_flow_year1(update: Update, context) -> int:
+
+async def npv_cash_flow_year1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["cash_flow_year1"] = float(update.message.text)
-        await update.message.reply_text("Введите ставку дисконтирования (в процентах, например, 10 для 10%):")
-        return NPV_DISCOUNT_RATE
+        context.user_data["cash_flow_year1"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return NPV_CASH_FLOW_YEAR1
+    await update.message.reply_text(
+        "Введите ставку дисконтирования (в процентах, например, 10 для 10%):"
+    )
+    return NPV_DISCOUNT_RATE
 
-async def npv_discount_rate(update: Update, context) -> int:
+
+async def npv_discount_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["discount_rate"] = float(update.message.text)
-        initial_investment = context.user_data["initial_investment"]
-        cash_flow_year1 = context.user_data["cash_flow_year1"]
-        discount_rate = context.user_data["discount_rate"]
-
-        npv = calculate_npv(initial_investment, cash_flow_year1, discount_rate)
-
-        if npv is None:
-            await update.message.reply_text(
-                "Ошибка: Ставка дисконтирования не может быть меньше -100%. Пожалуйста, попробуйте снова."
-            )
-            return NPV_INITIAL_INVESTMENT # Restart the calculation
-
-        explanation = ""
-        if npv > 0:
-            explanation = f"Положительный NPV ({npv:.2f}) означает, что проект выгоден и ожидается, что он принесет больше денежных средств, чем было вложено, с учетом временной стоимости денег."
-        elif npv < 0:
-            explanation = f"Отрицательный NPV ({npv:.2f}) означает, что проект невыгоден и, вероятно, не окупит вложенные средства с учетом дисконтирования."
-        else:
-            explanation = "NPV равен нулю. Проект окупится, но не принесет дополнительной прибыли сверх требуемой нормы доходности."
-
-        result_text = f"NPV: {npv:.2f}\n\n{explanation}"
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        context.user_data["history"].append(f"[{timestamp}] {context.user_data["current_calculation"]}: {result_text}")
-        keyboard = [[InlineKeyboardButton("Главное меню", callback_data='main_menu')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return MENU
+        discount_rate = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return NPV_DISCOUNT_RATE
 
-# --- Optimal Price handlers ---
+    npv = calculate_npv(
+        context.user_data["initial_investment"], context.user_data["cash_flow_year1"], discount_rate
+    )
+    if npv is None:
+        await update.message.reply_text(
+            "Ошибка: Ставка дисконтирования не может быть меньше -100%. Пожалуйста, попробуйте снова."
+        )
+        return NPV_INITIAL_INVESTMENT  # restart the calculation
 
-async def optimal_price_start(update: Update, context) -> int:
+    if npv > 0:
+        explanation = (
+            f"Положительный NPV ({npv:.2f}) означает, что проект выгоден и ожидается, что он "
+            f"принесет больше денежных средств, чем было вложено, с учетом временной стоимости денег."
+        )
+    elif npv < 0:
+        explanation = (
+            f"Отрицательный NPV ({npv:.2f}) означает, что проект невыгоден и, вероятно, не окупит "
+            f"вложенные средства с учетом дисконтирования."
+        )
+    else:
+        explanation = (
+            "NPV равен нулю. Проект окупится, но не принесет дополнительной прибыли сверх "
+            "требуемой нормы доходности."
+        )
+
+    result_text = f"NPV: {npv:.2f}\n\n{explanation}"
+    record_result(context, result_text)
+    await send_long_message(update, result_text, reply_markup=result_markup())
+    return MENU
+
+
+# --------------------------------------------------------------------------- #
+# Optimal-price handlers                                                      #
+# --------------------------------------------------------------------------- #
+
+
+async def optimal_price_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data["current_calculation"] = "Расчёт оптимальной цены"
     await query.edit_message_text("Введите себестоимость единицы продукции:")
     return OPTIMAL_PRICE_UNIT_COST
 
-async def optimal_price_unit_cost(update: Update, context) -> int:
+
+async def optimal_price_unit_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["unit_cost"] = float(update.message.text)
-        await update.message.reply_text("Введите желаемую наценку (в процентах, например, 20 для 20%):")
-        return OPTIMAL_PRICE_MARKUP
+        context.user_data["unit_cost"] = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return OPTIMAL_PRICE_UNIT_COST
+    await update.message.reply_text("Введите желаемую наценку (в процентах, например, 20 для 20%):")
+    return OPTIMAL_PRICE_MARKUP
 
-async def optimal_price_markup(update: Update, context) -> int:
+
+async def optimal_price_markup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        context.user_data["desired_markup_percentage"] = float(update.message.text)
-        unit_cost = context.user_data["unit_cost"]
-        desired_markup_percentage = context.user_data["desired_markup_percentage"]
-
-        optimal_price = calculate_optimal_price(unit_cost, desired_markup_percentage)
-
-        if optimal_price is None:
-            await update.message.reply_text(
-                "Ошибка: Желаемая наценка не может быть меньше -100%. Пожалуйста, попробуйте снова."
-            )
-            return OPTIMAL_PRICE_UNIT_COST # Restart the calculation
-
-        explanation = (
-            f"Оптимальная цена в {optimal_price:.2f} установлена с учетом вашей себестоимости и желаемой наценки. "
-            f"Эта цена должна обеспечить желаемый уровень прибыли."
-        )
-        result_text = f"Оптимальная цена: {optimal_price:.2f}\n\n{explanation}"
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        context.user_data["history"].append(f"[{timestamp}] {context.user_data["current_calculation"]}: {result_text}")
-        keyboard = [[InlineKeyboardButton("Главное меню", callback_data='main_menu')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return MENU
+        desired_markup_percentage = parse_number(update.message.text)
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите числовое значение.")
         return OPTIMAL_PRICE_MARKUP
 
-# --- History handler ---
+    optimal_price = calculate_optimal_price(context.user_data["unit_cost"], desired_markup_percentage)
+    if optimal_price is None:
+        await update.message.reply_text(
+            "Ошибка: Желаемая наценка не может быть меньше -100%. Пожалуйста, попробуйте снова."
+        )
+        return OPTIMAL_PRICE_UNIT_COST  # restart the calculation
 
-async def show_history(update: Update, context) -> int:
+    explanation = (
+        f"Оптимальная цена в {optimal_price:.2f} установлена с учетом вашей себестоимости и "
+        f"желаемой наценки. Эта цена должна обеспечить желаемый уровень прибыли."
+    )
+    result_text = f"Оптимальная цена: {optimal_price:.2f}\n\n{explanation}"
+    record_result(context, result_text)
+    await send_long_message(update, result_text, reply_markup=result_markup())
+    return MENU
+
+
+# --------------------------------------------------------------------------- #
+# History handler                                                             #
+# --------------------------------------------------------------------------- #
+
+
+async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
 
-    if not context.user_data['history']:
-        history_text = "История расчётов пуста."
-    else:
-        history_text = "Ваша история расчётов:\n\n" + "\n---\n".join(context.user_data['history'])
+    history: list[str] = list(context.user_data.get("history", []))
+    if not history:
+        await safe_edit(query, "История расчётов пуста.", reply_markup=result_markup())
+        return MENU
 
-    keyboard = [[InlineKeyboardButton("Главное меню", callback_data='main_menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(history_text, reply_markup=reply_markup)
+    body = "\n---\n".join(history)
+    header = f"Ваша история расчётов (последние {len(history)}):\n\n"
+    # A single edit_message_text call cannot exceed the Telegram limit, so we
+    # drop the oldest entries until the message fits.
+    while len(header) + len(body) > TELEGRAM_MESSAGE_LIMIT and len(history) > 1:
+        history = history[1:]
+        body = "\n---\n".join(history)
+        header = f"Ваша история расчётов (последние {len(history)}):\n\n"
+    await safe_edit(query, header + body, reply_markup=result_markup())
     return MENU
 
-async def cancel(update: Update, context) -> int:
-    """Cancels and ends the conversation."""
-    user = update.message.from_user
-    logger.info("User %s canceled the conversation.", user.first_name)
-    await update.message.reply_text(
-        "До свидания! Надеюсь, я был полезен.", reply_markup=ReplyKeyboardRemove()
-    )
-    return ConversationHandler.END
 
-def main() -> None:
-    """Run the bot."""
-    # Token from environment variable
-    TOKEN = os.environ.get("BOT_TOKEN")
-    if not TOKEN:
-        raise ValueError("BOT_TOKEN environment variable is not set!")
-    application = Application.builder().token(TOKEN).build()
+# --------------------------------------------------------------------------- #
+# Global error handler                                                        #
+# --------------------------------------------------------------------------- #
 
-    # Add conversation handler with states
-    conv_handler = ConversationHandler(
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Make sure a single bad update never takes the whole service down."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    if not isinstance(update, Update):
+        return
+    if update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "Произошла внутренняя ошибка. Попробуйте ещё раз или начните с /start."
+            )
+        except Exception:  # pragma: no cover - best-effort notification
+            logger.exception("Failed to notify user about the error")
+    elif update.callback_query:
+        try:
+            await update.callback_query.answer("Произошла внутренняя ошибка.", show_alert=True)
+        except Exception:  # pragma: no cover - best-effort notification
+            logger.exception("Failed to notify user about the error")
+
+
+# --------------------------------------------------------------------------- #
+# Handler wiring                                                              #
+# --------------------------------------------------------------------------- #
+
+
+def _exact(name: str) -> re.Pattern[str]:
+    return re.compile(rf"^{name}$")
+
+
+_CALLBACK_STARTERS = (
+    break_even_start, margin_start, roi_start, unit_cost_start,
+    elasticity_start, profit_loss_start, avg_marginal_costs_start,
+    markup_discount_start, payback_period_start, operating_leverage_start,
+    npv_start, optimal_price_start, show_history,
+)
+
+
+def build_conversation_handler() -> ConversationHandler:
+    """Create the ConversationHandler shared by both run modes."""
+    menu_callbacks = [
+        CallbackQueryHandler(handler, pattern=_exact(cb))
+        for handler, (_, cb) in zip(_CALLBACK_STARTERS, MENU_ITEMS)
+    ]
+    back_to_menu = CallbackQueryHandler(show_menu_from_query, pattern=_exact("main_menu"))
+
+    states: dict[int, list[Any]] = {
+        MENU: menu_callbacks,
+        BREAK_EVEN_FIXED_COSTS: [numeric_state_handler(break_even_fixed_costs)],
+        BREAK_EVEN_VARIABLE_COST: [numeric_state_handler(break_even_variable_cost)],
+        BREAK_EVEN_PRICE: [numeric_state_handler(break_even_price), back_to_menu],
+        MARGIN_REVENUE: [numeric_state_handler(margin_revenue)],
+        MARGIN_COST_OF_GOODS: [numeric_state_handler(margin_cost_of_goods), back_to_menu],
+        ROI_PROFIT: [numeric_state_handler(roi_profit)],
+        ROI_COST: [numeric_state_handler(roi_cost), back_to_menu],
+        UNIT_COST_FIXED_COSTS: [numeric_state_handler(unit_cost_fixed_costs)],
+        UNIT_COST_VARIABLE_COSTS: [numeric_state_handler(unit_cost_variable_costs)],
+        UNIT_COST_UNITS: [numeric_state_handler(unit_cost_units), back_to_menu],
+        ELASTICITY_QUANTITY_CHANGE: [numeric_state_handler(elasticity_quantity_change)],
+        ELASTICITY_PRICE_CHANGE: [numeric_state_handler(elasticity_price_change), back_to_menu],
+        PROFIT_LOSS_REVENUE: [numeric_state_handler(profit_loss_revenue)],
+        PROFIT_LOSS_COSTS: [numeric_state_handler(profit_loss_costs), back_to_menu],
+        AVG_MARGINAL_COST_CURRENT_TOTAL_COST: [numeric_state_handler(avg_marginal_costs_current_total_cost)],
+        AVG_MARGINAL_COST_PREVIOUS_TOTAL_COST: [numeric_state_handler(avg_marginal_costs_previous_total_cost)],
+        AVG_MARGINAL_COST_CURRENT_QUANTITY: [numeric_state_handler(avg_marginal_costs_current_quantity)],
+        AVG_MARGINAL_COST_PREVIOUS_QUANTITY: [numeric_state_handler(avg_marginal_costs_previous_quantity), back_to_menu],
+        MARKUP_DISCOUNT_TYPE: [
+            CallbackQueryHandler(markup_discount_type, pattern=re.compile(r"^(markup|discount)$"))
+        ],
+        MARKUP_DISCOUNT_PRICE: [numeric_state_handler(markup_discount_price)],
+        MARKUP_DISCOUNT_PERCENTAGE: [numeric_state_handler(markup_discount_percentage), back_to_menu],
+        PAYBACK_INVESTMENT: [numeric_state_handler(payback_investment)],
+        PAYBACK_CASH_FLOW: [numeric_state_handler(payback_cash_flow), back_to_menu],
+        OPERATING_LEVERAGE_REVENUE: [numeric_state_handler(operating_leverage_revenue)],
+        OPERATING_LEVERAGE_VARIABLE_COSTS: [numeric_state_handler(operating_leverage_variable_costs)],
+        OPERATING_LEVERAGE_FIXED_COSTS: [numeric_state_handler(operating_leverage_fixed_costs), back_to_menu],
+        NPV_INITIAL_INVESTMENT: [numeric_state_handler(npv_initial_investment)],
+        NPV_CASH_FLOW_YEAR1: [numeric_state_handler(npv_cash_flow_year1)],
+        NPV_DISCOUNT_RATE: [numeric_state_handler(npv_discount_rate), back_to_menu],
+        OPTIMAL_PRICE_UNIT_COST: [numeric_state_handler(optimal_price_unit_cost)],
+        OPTIMAL_PRICE_MARKUP: [numeric_state_handler(optimal_price_markup), back_to_menu],
+        HISTORY: [CallbackQueryHandler(show_history, pattern=_exact("history")), back_to_menu],
+    }
+
+    return ConversationHandler(
         entry_points=[CommandHandler("start", start)],
-        states={
-            MENU: [
-                CallbackQueryHandler(break_even_start, pattern='^break_even$\\b'),
-                CallbackQueryHandler(margin_start, pattern='^margin$\\b'),
-                CallbackQueryHandler(roi_start, pattern='^roi$\\b'),
-                CallbackQueryHandler(unit_cost_start, pattern='^unit_cost$\\b'),
-                CallbackQueryHandler(elasticity_start, pattern='^elasticity$\\b'),
-                CallbackQueryHandler(profit_loss_start, pattern='^profit_loss$\\b'),
-                CallbackQueryHandler(avg_marginal_costs_start, pattern='^avg_marginal_costs$\\b'),
-                CallbackQueryHandler(markup_discount_start, pattern='^markup_discount$\\b'),
-                CallbackQueryHandler(payback_period_start, pattern='^payback_period$\\b'),
-                CallbackQueryHandler(operating_leverage_start, pattern='^operating_leverage$\\b'),
-                CallbackQueryHandler(npv_start, pattern='^npv$\\b'),
-                CallbackQueryHandler(optimal_price_start, pattern='^optimal_price$\\b'),
-                CallbackQueryHandler(show_history, pattern='^history$\\b'),
-            ],
-            BREAK_EVEN_FIXED_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, break_even_fixed_costs)],
-            BREAK_EVEN_VARIABLE_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, break_even_variable_cost)],
-            BREAK_EVEN_PRICE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, break_even_price),
-                CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')
-            ],
-            MARGIN_REVENUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, margin_revenue)],
-            MARGIN_COST_OF_GOODS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, margin_cost_of_goods),
-                CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')
-            ],
-            ROI_PROFIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, roi_profit)],
-            ROI_COST: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, roi_cost),
-                CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')
-            ],
-            UNIT_COST_FIXED_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, unit_cost_fixed_costs)],
-            UNIT_COST_VARIABLE_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, unit_cost_variable_costs)],
-            UNIT_COST_UNITS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, unit_cost_units),
-                CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')
-            ],
-            ELASTICITY_QUANTITY_CHANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, elasticity_quantity_change)],
-            ELASTICITY_PRICE_CHANGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, elasticity_price_change),
-                CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')
-            ],
-            PROFIT_LOSS_REVENUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_loss_revenue)],
-            PROFIT_LOSS_COSTS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, profit_loss_costs),
-                CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')
-            ],
-            AVG_MARGINAL_COST_CURRENT_TOTAL_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, avg_marginal_costs_current_total_cost)],
-            AVG_MARGINAL_COST_PREVIOUS_TOTAL_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, avg_marginal_costs_previous_total_cost)],
-            AVG_MARGINAL_COST_CURRENT_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, avg_marginal_costs_current_quantity)],
-            AVG_MARGINAL_COST_PREVIOUS_QUANTITY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, avg_marginal_costs_previous_quantity),
-                CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')
-            ],
-            MARKUP_DISCOUNT_TYPE: [CallbackQueryHandler(markup_discount_type, pattern='^markup$|^discount$\\b')],
-            MARKUP_DISCOUNT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, markup_discount_price)],
-            MARKUP_DISCOUNT_PERCENTAGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, markup_discount_percentage),
-                CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')
-            ],
-            PAYBACK_INVESTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payback_investment)],
-            PAYBACK_CASH_FLOW: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, payback_cash_flow),
-                CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')
-            ],
-            OPERATING_LEVERAGE_REVENUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, operating_leverage_revenue)],
-            OPERATING_LEVERAGE_VARIABLE_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, operating_leverage_variable_costs)],
-            OPERATING_LEVERAGE_FIXED_COSTS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, operating_leverage_fixed_costs),
-                CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')
-            ],
-            NPV_INITIAL_INVESTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, npv_initial_investment)],
-            NPV_CASH_FLOW_YEAR1: [MessageHandler(filters.TEXT & ~filters.COMMAND, npv_cash_flow_year1)],
-            NPV_DISCOUNT_RATE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, npv_discount_rate),
-                CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')
-            ],
-            OPTIMAL_PRICE_UNIT_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, optimal_price_unit_cost)],
-            OPTIMAL_PRICE_MARKUP: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, optimal_price_markup),
-                CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')
-            ],
-            HISTORY: [
-                CallbackQueryHandler(show_history, pattern='^history$\\b'),
-                CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')
-            ],
-        },
-        fallbacks=[CommandHandler("start", start), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
+        states=states,
+        fallbacks=[
+            CommandHandler("start", start),
+            CommandHandler("help", help_command),
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(show_menu_from_query, pattern=_exact("main_menu")),
+            CallbackQueryHandler(cancel, pattern=_exact("cancel")),
+        ],
     )
 
-    application.add_handler(conv_handler)
 
-    # Run the bot until the user presses Ctrl-C
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-def build_application() -> Application:
-    """Build the Telegram application and register all handlers."""
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        raise ValueError("BOT_TOKEN environment variable is not set!")
-
-    application = Application.builder().token(token).build()
-
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            MENU: [
-                CallbackQueryHandler(break_even_start, pattern='^break_even$\\b'),
-                CallbackQueryHandler(margin_start, pattern='^margin$\\b'),
-                CallbackQueryHandler(roi_start, pattern='^roi$\\b'),
-                CallbackQueryHandler(unit_cost_start, pattern='^unit_cost$\\b'),
-                CallbackQueryHandler(elasticity_start, pattern='^elasticity$\\b'),
-                CallbackQueryHandler(profit_loss_start, pattern='^profit_loss$\\b'),
-                CallbackQueryHandler(avg_marginal_costs_start, pattern='^avg_marginal_costs$\\b'),
-                CallbackQueryHandler(markup_discount_start, pattern='^markup_discount$\\b'),
-                CallbackQueryHandler(payback_period_start, pattern='^payback_period$\\b'),
-                CallbackQueryHandler(operating_leverage_start, pattern='^operating_leverage$\\b'),
-                CallbackQueryHandler(npv_start, pattern='^npv$\\b'),
-                CallbackQueryHandler(optimal_price_start, pattern='^optimal_price$\\b'),
-                CallbackQueryHandler(show_history, pattern='^history$\\b'),
-            ],
-            BREAK_EVEN_FIXED_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, break_even_fixed_costs)],
-            BREAK_EVEN_VARIABLE_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, break_even_variable_cost)],
-            BREAK_EVEN_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, break_even_price), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
-            MARGIN_REVENUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, margin_revenue)],
-            MARGIN_COST_OF_GOODS: [MessageHandler(filters.TEXT & ~filters.COMMAND, margin_cost_of_goods), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
-            ROI_PROFIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, roi_profit)],
-            ROI_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, roi_cost), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
-            UNIT_COST_FIXED_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, unit_cost_fixed_costs)],
-            UNIT_COST_VARIABLE_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, unit_cost_variable_costs)],
-            UNIT_COST_UNITS: [MessageHandler(filters.TEXT & ~filters.COMMAND, unit_cost_units), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
-            ELASTICITY_QUANTITY_CHANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, elasticity_quantity_change)],
-            ELASTICITY_PRICE_CHANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, elasticity_price_change), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
-            PROFIT_LOSS_REVENUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_loss_revenue)],
-            PROFIT_LOSS_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_loss_costs), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
-            AVG_MARGINAL_COST_CURRENT_TOTAL_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, avg_marginal_costs_current_total_cost)],
-            AVG_MARGINAL_COST_PREVIOUS_TOTAL_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, avg_marginal_costs_previous_total_cost)],
-            AVG_MARGINAL_COST_CURRENT_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, avg_marginal_costs_current_quantity)],
-            AVG_MARGINAL_COST_PREVIOUS_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, avg_marginal_costs_previous_quantity), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
-            MARKUP_DISCOUNT_TYPE: [CallbackQueryHandler(markup_discount_type, pattern='^markup$|^discount$\\b')],
-            MARKUP_DISCOUNT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, markup_discount_price)],
-            MARKUP_DISCOUNT_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, markup_discount_percentage), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
-            PAYBACK_INVESTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payback_investment)],
-            PAYBACK_CASH_FLOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, payback_cash_flow), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
-            OPERATING_LEVERAGE_REVENUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, operating_leverage_revenue)],
-            OPERATING_LEVERAGE_VARIABLE_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, operating_leverage_variable_costs)],
-            OPERATING_LEVERAGE_FIXED_COSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, operating_leverage_fixed_costs), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
-            NPV_INITIAL_INVESTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, npv_initial_investment)],
-            NPV_CASH_FLOW_YEAR1: [MessageHandler(filters.TEXT & ~filters.COMMAND, npv_cash_flow_year1)],
-            NPV_DISCOUNT_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, npv_discount_rate), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
-            OPTIMAL_PRICE_UNIT_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, optimal_price_unit_cost)],
-            OPTIMAL_PRICE_MARKUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, optimal_price_markup), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
-            HISTORY: [CallbackQueryHandler(show_history, pattern='^history$\\b'), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
-        },
-        fallbacks=[CommandHandler("start", start), CallbackQueryHandler(back_to_menu, pattern='^main_menu$\\b')],
-    )
-    application.add_handler(conv_handler)
-    return application
+# --------------------------------------------------------------------------- #
+# Webhook lifecycle hooks                                                     #
+# --------------------------------------------------------------------------- #
 
 
-telegram_application = build_application()
-app = FastAPI(title="Marginal Telegram Bot")
-
-
-@app.on_event("startup")
-async def startup() -> None:
-    external_url = os.environ.get("RENDER_EXTERNAL_URL")
-    secret = os.environ.get("WEBHOOK_SECRET")
-    if not external_url or not secret:
-        raise RuntimeError("RENDER_EXTERNAL_URL and WEBHOOK_SECRET must be set")
-
-    await telegram_application.initialize()
-    await telegram_application.start()
-    webhook_url = f"{external_url.rstrip('/')}/telegram/webhook"
-    await telegram_application.bot.set_webhook(
+async def post_init(application: Application) -> None:
+    """Register the webhook right after the bot starts (webhook mode only)."""
+    if RUN_MODE != "webhook":
+        return
+    base_url = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEBHOOK_URL")
+    if not base_url:
+        raise RuntimeError(
+            "Webhook mode requires RENDER_EXTERNAL_URL or WEBHOOK_URL to be set. "
+            "Set MODE=polling to run without a public URL."
+        )
+    webhook_url = f"{base_url.rstrip('/')}{WEBHOOK_PATH}"
+    await application.bot.set_webhook(
         url=webhook_url,
-        secret_token=secret,
+        secret_token=WEBHOOK_SECRET,
         allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
     )
     logger.info("Telegram webhook configured: %s", webhook_url)
 
 
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    await telegram_application.bot.delete_webhook()
-    await telegram_application.stop()
-    await telegram_application.shutdown()
+async def post_shutdown(application: Application) -> None:
+    """Remove the webhook on shutdown so a redeploy can fall back cleanly."""
+    if RUN_MODE != "webhook" or application.bot is None:
+        return
+    try:
+        await application.bot.delete_webhook()
+        logger.info("Telegram webhook removed.")
+    except Exception:  # pragma: no cover - best effort during shutdown
+        logger.exception("Failed to delete webhook during shutdown")
 
 
-@app.get("/")
+def build_application() -> Application:
+    """Build the Telegram application and register all handlers."""
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+    application.add_handler(build_conversation_handler())
+    application.add_error_handler(on_error)
+    return application
+
+
+# --------------------------------------------------------------------------- #
+# Webhook ASGI application                                                    #
+# --------------------------------------------------------------------------- #
+
+_lifespan_application: Optional[Application] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Start/stop the Telegram application together with the ASGI server."""
+    global _lifespan_application
+    if RUN_MODE == "webhook" and not (
+        os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEBHOOK_URL")
+    ):
+        raise RuntimeError(
+            "Webhook mode requires RENDER_EXTERNAL_URL or WEBHOOK_URL to be set. "
+            "Set MODE=polling to run without a public URL."
+        )
+    application = build_application()
+    _lifespan_application = application
+    if RUN_MODE == "polling":
+        await application.initialize()
+        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await application.start()
+        logger.info("Telegram bot started in polling mode.")
+    else:
+        await application.initialize()  # triggers post_init -> set_webhook
+        await application.start()
+        logger.info("Telegram bot started in webhook mode.")
+    try:
+        yield
+    finally:
+        if RUN_MODE == "polling":
+            await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
+        _lifespan_application = None
+        logger.info("Telegram bot stopped.")
+
+
+app = FastAPI(title="Marginal Telegram Bot", version="1.0.0", lifespan=lifespan)
+
+
+@app.get("/", tags=["health"])
 async def healthcheck() -> dict[str, str]:
+    """Liveness probe used by load balancers / uptime checks."""
     return {"status": "ok"}
 
 
-@app.post("/telegram/webhook")
+@app.get("/healthz", tags=["health"])
+async def healthz() -> dict[str, Any]:
+    """Readiness probe: reports whether the Telegram application is running."""
+    ready = _lifespan_application is not None and _lifespan_application.running
+    return {"status": "ok" if ready else "starting", "bot_ready": ready}
+
+
+@app.post(WEBHOOK_PATH, tags=["telegram"])
 async def telegram_webhook(
     request: Request,
-    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
 ) -> JSONResponse:
-    expected_secret = os.environ.get("WEBHOOK_SECRET")
-    if not expected_secret or x_telegram_bot_api_secret_token != expected_secret:
+    """Receive Telegram updates pushed via webhook (secret-token protected)."""
+    if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
+    if _lifespan_application is None:
+        raise HTTPException(status_code=503, detail="Bot is not ready yet")
 
-    payload = await request.json()
-    update = Update.de_json(payload, telegram_application.bot)
-    await telegram_application.process_update(update)
+    try:
+        payload: dict = await request.json()
+        update = Update.de_json(payload, _lifespan_application.bot)
+    except (TypeError, KeyError, ValueError):
+        logger.warning("Discarded malformed webhook payload")
+        raise HTTPException(status_code=400, detail="Malformed update")
+    await _lifespan_application.process_update(update)
     return JSONResponse({"ok": True})
 
 
-if __name__ == '__main__':
-    main()
+# --------------------------------------------------------------------------- #
+# Polling entry point                                                         #
+# --------------------------------------------------------------------------- #
 
+
+def main() -> None:
+    """Run the bot with long polling (useful locally or in private containers)."""
+    application = build_application()
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()

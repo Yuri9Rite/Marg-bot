@@ -1,0 +1,29 @@
+# Local development stack.
+#   Polling mode (default, no public URL needed):  docker compose up
+#   Webhook mode: set BOT_TOKEN, WEBHOOK_URL, WEBHOOK_SECRET in .env and
+#   run: docker compose up --build marg-bot-webhook
+services:
+  # Long-polling bot — simplest way to run locally.
+  marg-bot:
+    build: .
+    command: python econ_bot.py
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?set BOT_TOKEN in .env}
+      MODE: polling
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    restart: unless-stopped
+
+  # Webhook bot behind the FastAPI/uvicorn server.
+  marg-bot-webhook:
+    build: .
+    profiles: ["webhook"]
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?set BOT_TOKEN in .env}
+      MODE: webhook
+      WEBHOOK_URL: ${WEBHOOK_URL:?set WEBHOOK_URL in .env}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?set WEBHOOK_SECRET in .env}
+      PORT: 8000
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    restart: unless-stopped
