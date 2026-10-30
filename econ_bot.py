@@ -1622,10 +1622,27 @@ async def telegram_webhook(
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Webhook body must be an object")
-    update = Update.de_json(payload, telegram_application.bot)
+
+    app = telegram_application
+    lock = webhook_update_lock
+    if app is None or lock is None:
+        raise HTTPException(status_code=503, detail="Bot is not initialized yet")
+
+    try:
+        update = Update.de_json(payload, app.bot)
+    except (TypeError, KeyError, ValueError, AttributeError) as exc:
+        # Мусор/тестовые тела не должны ронять обработчик в 500.
+        logger.warning("Ignoring malformed webhook payload: %s", exc)
+        raise HTTPException(status_code=400, detail="Malformed Telegram update") from exc
+
     # ConversationHandler зависит от последовательного обновления состояния.
-    async with webhook_update_lock:
-        await telegram_application.process_update(update)
+    async with lock:
+        try:
+            await app.process_update(update)
+        except Exception:
+            # Ошибка обработки одного апдейта не должна превращаться в 5xx
+            # для Telegram — иначе он считает вебхук сломанным и копит бэкофф.
+            logger.exception("Failed to process incoming update")
     return JSONResponse({"ok": True})
 
 
