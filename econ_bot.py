@@ -6,8 +6,9 @@
 
 Переменные окружения:
   BOT_TOKEN          — токен Telegram-бота (обязательно)
-  WEBHOOK_SECRET     — секрет для защиты вебхука (обязательно в webhook-режиме)
-  RENDER_EXTERNAL_URL — публичный URL сервиса (обязательно в webhook-режиме)
+  RENDER_EXTERNAL_URL / PUBLIC_URL — публичный HTTPS-URL сервиса (webhook-режим;
+                       на Render задавать не нужно, он предоставляется сам)
+  WEBHOOK_SECRET     — секрет для защиты вебхука (желателен, но не обязателен)
 """
 
 from __future__ import annotations
@@ -79,14 +80,47 @@ NOT_A_NUMBER_MSG = (
 # Calculation helpers
 # ---------------------------------------------------------------------------
 
+_THOUSANDS_RE = re.compile(r"^([+-]?\d{1,3})((?:[ ,.\u00a0]\d{3})+)$")
+
+
 def parse_number(text: str) -> Optional[float]:
-    """Безопасно преобразует пользовательский ввод в float."""
-    cleaned = text.strip().replace("\u00a0", " ").replace(",", ".", 1) \
-        if text.strip().count(",") == 1 and "." not in text else text.strip()
+    """Безопасно преобразует пользовательский ввод в float.
+
+    Поддерживает: «10.5», «10,5» (запятая как десятичный разделитель),
+    «1 000» / «1\u00a0000» / «1,000» (разделители тысяч).
+    Точка всегда трактуется как десятичный разделитель (как в float()),
+    чтобы не перевирать значения вроде «0.001».
+    """
+    s = text.strip().replace("\u00a0", " ")
+    if not s:
+        return None
+    m = _THOUSANDS_RE.match(s)
+    if m and m.group(1) != "0" \
+            and (" " in m.group(2) or "," in m.group(2)):
+        # Однозначный формат тысяч («1 000», «1,000», «12 345 678»).
+        # Ведущий ноль («0,001») — это десятичная дробь, не тысячи.
+        # Смешанный «1.234,56» отклоняем — лучше попросить ввод заново,
+        # чем неверно истолковать число.
+        if "." in m.group(2):
+            return None
+        s = m.group(1) + m.group(2).replace(" ", "").replace(",", "")
+    elif s.count(",") == 1 and "." not in s:
+        # Одна запятая как десятичный разделитель: 10,5 -> 10.5
+        # Исключение — формат тысяч «N,000» (3 цифры после запятой, первая 0):
+        # «5,000» = 5000, а «0,001» остаётся дробью 0.001.
+        if re.fullmatch(r"[+-]?[1-9]\d{0,2},0\d\d", s):
+            s = s.replace(",", "")
+        else:
+            s = s.replace(",", ".")
     try:
-        return float(cleaned)
+        value = float(s)
     except (ValueError, TypeError):
         return None
+    # Отклоняем ввод без значащей цифры перед разделителем («.5», «,5») и nan/inf
+    if not re.match(r"[+-]?\d", s) or value != value \
+            or value in (float("inf"), float("-inf")):
+        return None
+    return value
 
 
 def calculate_break_even(fixed_costs: float, variable_cost_per_unit: float,
@@ -268,7 +302,7 @@ async def safe_edit_message(query, text: str, reply_markup=None) -> None:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Приветствие и главное меню."""
     # Инициализация истории (deque со встроенным ограничением размера)
-    if "history" not in context.user_data:
+    if "history" not in context.user_
         context.user_data["history"] = deque(maxlen=MAX_HISTORY_ENTRIES)
 
     welcome = (
@@ -1142,16 +1176,31 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Application builder
 # ---------------------------------------------------------------------------
 
-def build_application(token: str) -> Application:
-    """Создаёт Telegram-приложение и регистрирует все обработчики."""
-    application = (
-        Application.builder()
-        .token(token)
-        .post_init(post_init_setup)
-        .post_shutdown(post_shutdown_cleanup)
-        .concurrent_updates(True)
-        .build()
-    )
+def build_application(token: str, *, webhook_mode: bool = False) -> Application:
+    """Создаёт Telegram-приложение и регистрирует все обработчики.
+
+    webhook_mode=True — для продакшена (FastAPI/Render): при старте
+    регистрируется вебхук, а при его недоступности включается polling.
+    webhook_mode=False — локальный long polling: перед стартом удаляется
+    ранее зарегистрированный вебхук (иначе Telegram продолжит слать
+    обновления на старый URL и поллинг ничего не получит), затем
+    устанавливаются команды бота.
+    """
+    async def polling_post_init(application: Application) -> None:
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=False)
+            logger.info("Stale webhook deleted — polling will receive updates")
+        except Exception:  # noqa: BLE001
+            logger.exception("delete_webhook before polling failed")
+        await set_my_commands_only(application)
+
+    builder = Application.builder().token(token).concurrent_updates(True)
+    if webhook_mode:
+        builder = builder.post_init(post_init_setup).post_shutdown(
+            post_shutdown_cleanup)
+    else:
+        builder = builder.post_init(polling_post_init)
+    application = builder.build()
     application.add_error_handler(on_error)
 
     menu_callbacks = "^=(?:" + "|".join(cb for cb, _ in MENU_ITEMS) + ")$"
@@ -1272,29 +1321,76 @@ async def unknown_message_handler(update: Update,
 # Webhook lifecycle (Render / Docker)
 # ---------------------------------------------------------------------------
 
+def get_public_base_url() -> Optional[str]:
+    """Определяет публичный HTTPS-адрес сервиса.
+
+    Сначала используется RENDER_EXTERNAL_URL (предоставляется Render
+    автоматически), затем PUBLIC_URL как ручной fallback для других
+    хостингов/туннелей.
+    """
+    for var in ("RENDER_EXTERNAL_URL", "PUBLIC_URL"):
+        value = os.environ.get(var, "").strip()
+        if value.startswith("https://"):
+            return value.rstrip("/")
+    return None
+
+
+BOT_COMMANDS = [
+    ("start", "Главное меню"),
+    ("help", "Справка"),
+    ("cancel", "Отменить текущий расчёт"),
+]
+
+
+async def set_my_commands_only(application: Application) -> None:
+    """Регистрирует список команд бота в меню Telegram."""
+    await application.bot.set_my_commands(BOT_COMMANDS)
+
+
 async def post_init_setup(application: Application) -> None:
-    """Регистрирует вебхук и команды бота при старте."""
-    secret = os.environ.get("WEBHOOK_SECRET")
-    external_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if secret and external_url:
-        webhook_url = f"{external_url.rstrip('/')}/telegram/webhook"
-        await application.bot.set_webhook(
-            url=webhook_url,
-            secret_token=secret,
+    """Регистрирует вебхук и команды бота при старте.
+
+    Если публичный HTTPS-URL недоступен или регистрация вебхука не удалась,
+    бот автоматически переключается на long polling — Telegram-обновления
+    начинают поступать даже без настроенного вебхука.
+    """
+    secret = os.environ.get("WEBHOOK_SECRET") or None
+    base_url = get_public_base_url()
+    webhook_ok = False
+    if base_url:
+        webhook_url = f"{base_url}/telegram/webhook"
+        try:
+            await application.bot.set_webhook(
+                url=webhook_url,
+                secret_token=secret,
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+            )
+            webhook_ok = True
+            logger.info("Telegram webhook configured: %s%s",
+                        webhook_url, "" if secret else " (без секрет-токена)")
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "setWebhook failed — falling back to long polling")
+    else:
+        logger.warning("RENDER_EXTERNAL_URL / PUBLIC_URL not set — "
+                       "falling back to long polling")
+
+    if not webhook_ok:
+        # Фолбэк: Telegram API недоступен через вебхук — забираем обновления
+        # сами. Это гарантирует, что бот отвечает даже при неверных env.
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=False)
+        except Exception:  # noqa: BLE001
+            logger.exception("delete_webhook before polling failed")
+        application.create_task(application.updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
-        )
-        logger.info("Telegram webhook configured: %s", webhook_url)
-    else:
-        logger.warning("WEBHOOK_SECRET / RENDER_EXTERNAL_URL are not set — "
-                       "webhook will not be registered.")
+            bootstrap_retries=-1,
+        ), name="fallback_polling")
+        logger.info("Long-polling fallback started")
 
-    commands = [
-        ("start", "Главное меню"),
-        ("help", "Справка"),
-        ("cancel", "Отменить текущий расчёт"),
-    ]
-    await application.bot.set_my_commands(commands)
+    await set_my_commands_only(application)
 
 
 async def post_shutdown_cleanup(application: Application) -> None:
@@ -1317,7 +1413,7 @@ async def lifespan(_: FastAPI):
     if not token:
         raise RuntimeError("Environment variable BOT_TOKEN is not set!")
 
-    telegram_application = build_application(token)
+    telegram_application = build_application(token, webhook_mode=True)
     await telegram_application.initialize()
     await telegram_application.start()
     logger.info("Telegram bot initialized in webhook mode")
@@ -1331,8 +1427,35 @@ app = FastAPI(title="Marginal Telegram Bot", version="1.1.0", lifespan=lifespan)
 
 
 @app.get("/")
+@app.head("/")
 async def healthcheck() -> dict[str, str]:
     return {"status": "ok", "bot": "Marg-bot"}
+
+
+@app.get("/debug/env")
+async def debug_env() -> dict[str, object]:
+    """Диагностика: видно ли боту нужные переменные окружения (значения не выдаются)."""
+    base_url = get_public_base_url()
+    info: dict[str, object] = {
+        "BOT_TOKEN_set": bool(os.environ.get("BOT_TOKEN")),
+        "WEBHOOK_SECRET_set": bool(os.environ.get("WEBHOOK_SECRET")),
+        "RENDER_EXTERNAL_URL": os.environ.get("RENDER_EXTERNAL_URL"),
+        "PUBLIC_URL": os.environ.get("PUBLIC_URL"),
+        "resolved_base_url": base_url,
+        "webhook_url_would_be": f"{base_url}/telegram/webhook" if base_url else None,
+        "bot_initialized": telegram_application is not None,
+    }
+    if telegram_application is not None:
+        try:
+            wh = await telegram_application.bot.get_webhook_info()
+            info["telegram_webhook"] = {
+                "url": wh.url,
+                "pending_update_count": wh.pending_update_count,
+                "last_error_message": wh.last_error_message,
+            }
+        except Exception as exc:  # noqa: BLE001
+            info["telegram_webhook_error"] = str(exc)
+    return info
 
 
 @app.post("/telegram/webhook")
@@ -1344,7 +1467,7 @@ async def telegram_webhook(
         raise HTTPException(status_code=503, detail="Bot is not initialized yet")
 
     expected_secret = os.environ.get("WEBHOOK_SECRET")
-    if not expected_secret or x_telegram_bot_api_secret_token != expected_secret:
+    if expected_secret and x_telegram_bot_api_secret_token != expected_secret:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     payload = await request.json()
@@ -1362,7 +1485,7 @@ def main() -> None:
     token = os.environ.get("BOT_TOKEN")
     if not token:
         raise SystemExit("Environment variable BOT_TOKEN is not set!")
-    application = build_application(token)
+    application = build_application(token, webhook_mode=False)
     logger.info("Starting Marg-bot in polling mode")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
