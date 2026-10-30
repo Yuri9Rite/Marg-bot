@@ -1,4 +1,4 @@
-d"""Marg-bot — Telegram-бот для расчёта микроэкономических показателей.
+"""Marg-bot — Telegram-бот для расчёта микроэкономических показателей.
 
 Поддерживает два режима запуска:
   * polling (по умолчанию, локальная разработка):  python econ_bot.py
@@ -8,18 +8,22 @@ d"""Marg-bot — Telegram-бот для расчёта микроэкономи�
   BOT_TOKEN          — токен Telegram-бота (обязательно)
   RENDER_EXTERNAL_URL / PUBLIC_URL — публичный HTTPS-URL сервиса (webhook-режим;
                        на Render задавать не нужно, он предоставляется сам)
-  WEBHOOK_SECRET     — секрет для защиты вебхука (желателен, но не обязателен)
+  WEBHOOK_SECRET     — секрет для защиты вебхука (обязателен в webhook-режиме)
 """
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import datetime
+import hashlib
 import logging
+import math
 import os
 import re
+import secrets
 from collections import deque
 from contextlib import asynccontextmanager
-from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -83,7 +87,7 @@ NOT_A_NUMBER_MSG = (
 _THOUSANDS_RE = re.compile(r"^([+-]?\d{1,3})((?:[ ,.\u00a0]\d{3})+)$")
 
 
-def parse_number(text: str) -> Optional[float]:
+def parse_number(text: str) -> float | None:
     """Безопасно преобразует пользовательский ввод в float.
 
     Поддерживает: «10.5», «10,5» (запятая как десятичный разделитель),
@@ -117,8 +121,7 @@ def parse_number(text: str) -> Optional[float]:
     except (ValueError, TypeError):
         return None
     # Отклоняем ввод без значащей цифры перед разделителем («.5», «,5») и nan/inf
-    if not re.match(r"[+-]?\d", s) or value != value \
-            or value in (float("inf"), float("-inf")):
+    if not re.match(r"[+-]?\d", s) or not math.isfinite(value):
         return None
     return value
 
@@ -175,7 +178,12 @@ def calculate_elasticity(quantity_change: float, price_change: float):
 
 def calculate_profit_loss(total_revenue: float, total_costs: float):
     profit_loss = total_revenue - total_costs
-    status = "Прибыль" if profit_loss >= 0 else "Убыток"
+    if profit_loss > 0:
+        status = "Прибыль"
+    elif profit_loss < 0:
+        status = "Убыток"
+    else:
+        status = "Безубыточность"
     return profit_loss, status
 
 
@@ -199,7 +207,7 @@ def calculate_markup_discount(base_price: float, percentage: float, is_discount:
 
 def calculate_payback_period(initial_investment: float, annual_cash_flow: float):
     """Срок окупаемости: (годы, месяцы)."""
-    if annual_cash_flow <= 0:
+    if initial_investment < 0 or annual_cash_flow <= 0:
         return None, None
     payback_years = initial_investment / annual_cash_flow
     years = int(payback_years)
@@ -213,7 +221,7 @@ def calculate_operating_leverage(total_revenue: float, variable_costs: float,
                                  fixed_costs: float):
     contribution_margin = total_revenue - variable_costs
     operating_income = contribution_margin - fixed_costs
-    if contribution_margin == 0 or operating_income == 0:
+    if contribution_margin <= 0 or operating_income <= 0:
         return None
     return contribution_margin / operating_income
 
@@ -282,14 +290,17 @@ async def send_result(update: Update, context: ContextTypes.DEFAULT_TYPE,
     """Отправляет результат расчёта с кнопкой возврата в меню."""
     add_history(context, result_text)
     await update.message.reply_text(
-        result_text, reply_markup=back_to_menu_button()
+        result_text, reply_markup=back_to_menu_button(),
+        parse_mode=ParseMode.HTML,
     )
 
 
 async def safe_edit_message(query, text: str, reply_markup=None) -> None:
     """Редактирует сообщение, игнорируя ошибку «message is not modified»."""
     try:
-        await query.edit_message_text(text=text, reply_markup=reply_markup)
+        await query.edit_message_text(
+            text=text, reply_markup=reply_markup, parse_mode=ParseMode.HTML
+        )
     except BadRequest as exc:
         if "message is not modified" not in str(exc):
             raise
@@ -325,7 +336,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "• себестоимость, эластичность спроса, прибыль/убыток\n"
         "• средние и предельные издержки, наценка/скидка\n"
         "• срок окупаемости, операционный рычаг, NPV, оптимальная цена\n\n"
-        f"Команды:\n/start — главное меню\n/help — эта справка\n"
+        "Команды:\n/start — главное меню\n/help — эта справка\n"
         "/cancel — прервать текущий расчёт\n\n"
         "История расчётов хранится только в текущей сессии бота."
     )
@@ -627,6 +638,9 @@ async def elasticity_quantity_change(update: Update, context: ContextTypes.DEFAU
     if value is None:
         await update.message.reply_text(NOT_A_NUMBER_MSG)
         return ELASTICITY_QUANTITY_CHANGE
+    if value < -100:
+        await update.message.reply_text("Изменение спроса не может быть ниже −100%. Введите значение от −100% и выше:")
+        return ELASTICITY_QUANTITY_CHANGE
     context.user_data["quantity_change"] = value
     await update.message.reply_text("Введите процентное изменение цены (например, 5 для роста на 5%):")
     return ELASTICITY_PRICE_CHANGE
@@ -636,6 +650,9 @@ async def elasticity_price_change(update: Update, context: ContextTypes.DEFAULT_
     value = parse_number(update.message.text)
     if value is None:
         await update.message.reply_text(NOT_A_NUMBER_MSG)
+        return ELASTICITY_PRICE_CHANGE
+    if value < -100:
+        await update.message.reply_text("Изменение цены не может быть ниже −100%. Введите значение от −100% и выше:")
         return ELASTICITY_PRICE_CHANGE
     context.user_data["price_change"] = value
 
@@ -857,6 +874,9 @@ async def markup_discount_price(update: Update, context: ContextTypes.DEFAULT_TY
     if value is None:
         await update.message.reply_text(NOT_A_NUMBER_MSG)
         return MARKUP_DISCOUNT_PRICE
+    if value < 0:
+        await update.message.reply_text("Базовая цена не может быть отрицательной. Введите 0 или положительное число:")
+        return MARKUP_DISCOUNT_PRICE
     context.user_data["base_price"] = value
     await update.message.reply_text("Введите процент (например, 20 для 20%):")
     return MARKUP_DISCOUNT_PERCENTAGE
@@ -867,11 +887,17 @@ async def markup_discount_percentage(update: Update, context: ContextTypes.DEFAU
     if value is None:
         await update.message.reply_text(NOT_A_NUMBER_MSG)
         return MARKUP_DISCOUNT_PERCENTAGE
+    is_discount = context.user_data["is_discount"]
+    if value < 0:
+        await update.message.reply_text("Процент не может быть отрицательным. Введите 0 или положительное число:")
+        return MARKUP_DISCOUNT_PERCENTAGE
+    if is_discount and value > 100:
+        await update.message.reply_text("Скидка не может превышать 100%. Введите значение от 0 до 100:")
+        return MARKUP_DISCOUNT_PERCENTAGE
     context.user_data["percentage"] = value
 
     base_price = context.user_data["base_price"]
     percentage = context.user_data["percentage"]
-    is_discount = context.user_data["is_discount"]
     new_price = calculate_markup_discount(base_price, percentage, is_discount)
 
     operation_type = "скидка" if is_discount else "наценка"
@@ -905,6 +931,9 @@ async def payback_investment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if value is None:
         await update.message.reply_text(NOT_A_NUMBER_MSG)
         return PAYBACK_INVESTMENT
+    if value < 0:
+        await update.message.reply_text("Инвестиции не могут быть отрицательными. Введите 0 или положительную сумму:")
+        return PAYBACK_INVESTMENT
     context.user_data["initial_investment"] = value
     await update.message.reply_text("Введите годовой денежный поток:")
     return PAYBACK_CASH_FLOW
@@ -922,7 +951,8 @@ async def payback_cash_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
     if years is None:
         await update.message.reply_text(
-            "⚠️ Ошибка: годовой денежный поток должен быть положительным. "
+            "⚠️ Ошибка: начальные инвестиции должны быть неотрицательными, "
+            "а годовой денежный поток — положительным. "
             "Начнём заново — введите начальные инвестиции:"
         )
         return PAYBACK_INVESTMENT
@@ -985,8 +1015,8 @@ async def operating_leverage_fixed_costs(update: Update, context: ContextTypes.D
     )
     if operating_leverage is None:
         await update.message.reply_text(
-            "⚠️ Ошибка: невозможно рассчитать операционный рычаг. Убедитесь, что выручка "
-            "больше переменных издержек, а операционная прибыль не равна нулю. "
+            "⚠️ Ошибка: операционный рычаг применим только при положительной марже покрытия "
+            "(выручка выше переменных затрат) и положительной операционной прибыли. "
             "Начнём заново — введите общую выручку:"
         )
         return OPERATING_LEVERAGE_REVENUE
@@ -1168,7 +1198,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.effective_message.reply_text(
                 "😔 Произошла непредвиденная ошибка. Попробуйте ещё раз или отправьте /start."
             )
-        except Exception:  # noqa: BLE001 - best-effort notification
+        except Exception:  # best-effort notification
             logger.exception("Failed to notify user about the error")
 
 
@@ -1179,8 +1209,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 def build_application(token: str, *, webhook_mode: bool = False) -> Application:
     """Создаёт Telegram-приложение и регистрирует все обработчики.
 
-    webhook_mode=True — для продакшена (FastAPI/Render): при старте
-    регистрируется вебхук, а при его недоступности включается polling.
+    webhook_mode=True — для продакшена (FastAPI/Render): webhook
+    регистрируется из FastAPI lifespan после initialize().
     webhook_mode=False — локальный long polling: перед стартом удаляется
     ранее зарегистрированный вебхук (иначе Telegram продолжит слать
     обновления на старый URL и поллинг ничего не получит), затем
@@ -1190,23 +1220,28 @@ def build_application(token: str, *, webhook_mode: bool = False) -> Application:
         try:
             await application.bot.delete_webhook(drop_pending_updates=False)
             logger.info("Stale webhook deleted — polling will receive updates")
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("delete_webhook before polling failed")
         await set_my_commands_only(application)
 
-    builder = Application.builder().token(token).concurrent_updates(True)
-    if webhook_mode:
-        builder = builder.post_init(post_init_setup).post_shutdown(
-            post_shutdown_cleanup)
-    else:
+    # ConversationHandler требует последовательной обработки обновлений.
+    builder = Application.builder().token(token).concurrent_updates(False)
+    if not webhook_mode:
+        # run_polling() сам вызывает этот callback после initialize().
         builder = builder.post_init(polling_post_init)
     application = builder.build()
     application.add_error_handler(on_error)
 
-    menu_callbacks = "^=(?:" + "|".join(cb for cb, _ in MENU_ITEMS) + ")$"
+    menu_callbacks = "^=(?:" + "|".join(
+        [cb for cb, _ in MENU_ITEMS] + ["main_menu"]
+    ) + ")$"
 
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            CommandHandler("help", help_command),
+            CommandHandler("cancel", cancel),
+        ],
         states={
             MENU: [
                 CallbackQueryHandler(break_even_start, pattern=r"^=break_even$"),
@@ -1309,19 +1344,19 @@ def build_application(token: str, *, webhook_mode: bool = False) -> Application:
 
 
 async def unknown_message_handler(update: Update,
-                                  context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Вежливо отвечает на стикеры, фото и прочие нетекстовые сообщения."""
+                                  context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    """Отвечает на нетекстовые сообщения, не сбрасывая активный сценарий."""
     await update.message.reply_text(
         "🤔 Я понимаю только числа и команды. Отправьте /start, чтобы начать."
     )
-    return ConversationHandler.END
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Webhook lifecycle (Render / Docker)
 # ---------------------------------------------------------------------------
 
-def get_public_base_url() -> Optional[str]:
+def get_public_base_url() -> str | None:
     """Определяет публичный HTTPS-адрес сервиса.
 
     Сначала используется RENDER_EXTERNAL_URL (предоставляется Render
@@ -1347,115 +1382,106 @@ async def set_my_commands_only(application: Application) -> None:
     await application.bot.set_my_commands(BOT_COMMANDS)
 
 
-async def post_init_setup(application: Application) -> None:
-    """Регистрирует вебхук и команды бота при старте.
+_TELEGRAM_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 
-    Если публичный HTTPS-URL недоступен или регистрация вебхука не удалась,
-    бот автоматически переключается на long polling — Telegram-обновления
-    начинают поступать даже без настроенного вебхука.
+
+def make_telegram_webhook_secret() -> str:
+    """Возвращает секрет, который Telegram принимает в setWebhook.
+
+    Render генерирует значения generateValue в Base64, где могут встречаться
+    запрещённые Telegram символы (+, / и =). В таком случае детерминированно
+    преобразуем секрет в URL-safe Base64 от SHA-256 исходного значения.
     """
-    secret = os.environ.get("WEBHOOK_SECRET") or None
+    raw_secret = os.environ.get("WEBHOOK_SECRET", "").strip()
+    if not raw_secret:
+        raise RuntimeError(
+            "WEBHOOK_SECRET is required; configure it in the Render environment"
+        )
+    if _TELEGRAM_SECRET_RE.fullmatch(raw_secret):
+        return raw_secret
+    digest = hashlib.sha256(raw_secret.encode("utf-8")).digest()
+    safe_secret = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    logger.warning(
+        "WEBHOOK_SECRET contained unsupported characters; using a URL-safe derived secret"
+    )
+    return safe_secret
+
+
+webhook_secret_token: str | None = None
+webhook_update_lock: asyncio.Lock | None = None
+
+
+async def post_init_setup(application: Application) -> None:
+    """Регистрирует webhook и команды после инициализации приложения."""
+    global webhook_secret_token
     base_url = get_public_base_url()
-    webhook_ok = False
-    if base_url:
-        webhook_url = f"{base_url}/telegram/webhook"
-        try:
-            await application.bot.set_webhook(
-                url=webhook_url,
-                secret_token=secret,
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-            )
-            webhook_ok = True
-            logger.info("Telegram webhook configured: %s%s",
-                        webhook_url, "" if secret else " (без секрет-токена)")
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "setWebhook failed — falling back to long polling")
-    else:
-        logger.warning("RENDER_EXTERNAL_URL / PUBLIC_URL not set — "
-                       "falling back to long polling")
+    if not base_url:
+        raise RuntimeError(
+            "No public HTTPS URL: set RENDER_EXTERNAL_URL or PUBLIC_URL"
+        )
 
-    if not webhook_ok:
-        # Фолбэк: Telegram API недоступен через вебхук — забираем обновления
-        # сами. Это гарантирует, что бот отвечает даже при неверных env.
-        try:
-            await application.bot.delete_webhook(drop_pending_updates=False)
-        except Exception:  # noqa: BLE001
-            logger.exception("delete_webhook before polling failed")
-        application.create_task(application.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            bootstrap_retries=-1,
-        ), name="fallback_polling")
-        logger.info("Long-polling fallback started")
-
-    await set_my_commands_only(application)
-
-
-async def post_shutdown_cleanup(application: Application) -> None:
-    """Убирает вебхук при остановке, чтобы вернуть pending updates."""
+    webhook_secret_token = make_telegram_webhook_secret()
+    await application.bot.set_webhook(
+        url=f"{base_url}/telegram/webhook",
+        secret_token=webhook_secret_token,
+        allowed_updates=Update.ALL_TYPES,
+        max_connections=1,
+        drop_pending_updates=False,
+    )
+    logger.info("Telegram webhook registered")
     try:
-        await application.bot.delete_webhook(drop_pending_updates=False)
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to delete webhook during shutdown")
+        await set_my_commands_only(application)
+    except Exception:
+        # Команды удобны, но их временная недоступность не должна ломать бота.
+        logger.exception("Could not register Telegram bot commands")
 
 
-telegram_application: Optional[Application] = None
+telegram_application: Application | None = None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """Жизненный цикл webhook-приложения (startup/shutdown)."""
-    global telegram_application  # noqa: PLW0603
+    """Управляет полным жизненным циклом PTB внутри FastAPI."""
+    global telegram_application, webhook_secret_token, webhook_update_lock
 
     token = os.environ.get("BOT_TOKEN")
     if not token:
-        raise RuntimeError("Environment variable BOT_TOKEN is not set!")
+        raise RuntimeError("BOT_TOKEN is required")
 
-    telegram_application = build_application(token, webhook_mode=True)
-    await telegram_application.initialize()
-    await telegram_application.start()
-    logger.info("Telegram bot initialized in webhook mode")
-    yield
-    await telegram_application.stop()
-    await telegram_application.shutdown()
-    logger.info("Telegram bot stopped")
+    application = build_application(token, webhook_mode=True)
+    telegram_application = application
+    webhook_update_lock = asyncio.Lock()
+    initialized = False
+    try:
+        await application.initialize()
+        initialized = True
+        # При ручном FastAPI lifecycle post_init не вызывается автоматически.
+        await post_init_setup(application)
+        await application.start()
+        logger.info("Telegram bot started in webhook mode")
+        yield
+    finally:
+        if initialized:
+            if application.running:
+                await application.stop()
+            # Не удаляем webhook при остановке: Render может штатно усыплять
+            # бесплатный сервис, а Telegram должен продолжать хранить обновления.
+            await application.shutdown()
+        telegram_application = None
+        webhook_secret_token = None
+        webhook_update_lock = None
+        logger.info("Telegram bot stopped")
 
 
-app = FastAPI(title="Marginal Telegram Bot", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Marginal Telegram Bot", version="1.2.0", lifespan=lifespan)
 
 
 @app.get("/")
 @app.head("/")
 async def healthcheck() -> dict[str, str]:
+    if telegram_application is None:
+        raise HTTPException(status_code=503, detail="Bot is not ready")
     return {"status": "ok", "bot": "Marg-bot"}
-
-
-@app.get("/debug/env")
-async def debug_env() -> dict[str, object]:
-    """Диагностика: видно ли боту нужные переменные окружения (значения не выдаются)."""
-    base_url = get_public_base_url()
-    info: dict[str, object] = {
-        "BOT_TOKEN_set": bool(os.environ.get("BOT_TOKEN")),
-        "WEBHOOK_SECRET_set": bool(os.environ.get("WEBHOOK_SECRET")),
-        "RENDER_EXTERNAL_URL": os.environ.get("RENDER_EXTERNAL_URL"),
-        "PUBLIC_URL": os.environ.get("PUBLIC_URL"),
-        "resolved_base_url": base_url,
-        "webhook_url_would_be": f"{base_url}/telegram/webhook" if base_url else None,
-        "bot_initialized": telegram_application is not None,
-    }
-    if telegram_application is not None:
-        try:
-            wh = await telegram_application.bot.get_webhook_info()
-            info["telegram_webhook"] = {
-                "url": wh.url,
-                "pending_update_count": wh.pending_update_count,
-                "last_error_message": wh.last_error_message,
-            }
-        except Exception as exc:  # noqa: BLE001
-            info["telegram_webhook_error"] = str(exc)
-    return info
 
 
 @app.post("/telegram/webhook")
@@ -1463,16 +1489,27 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ) -> JSONResponse:
-    if telegram_application is None:
+    if (telegram_application is None or webhook_secret_token is None
+            or webhook_update_lock is None):
         raise HTTPException(status_code=503, detail="Bot is not initialized yet")
 
-    expected_secret = os.environ.get("WEBHOOK_SECRET")
-    if expected_secret and x_telegram_bot_api_secret_token != expected_secret:
+    if (x_telegram_bot_api_secret_token is None
+            or not _TELEGRAM_SECRET_RE.fullmatch(x_telegram_bot_api_secret_token)
+            or not secrets.compare_digest(
+                x_telegram_bot_api_secret_token, webhook_secret_token
+            )):
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
-    payload = await request.json()
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Webhook body must be an object")
     update = Update.de_json(payload, telegram_application.bot)
-    await telegram_application.process_update(update)
+    # ConversationHandler зависит от последовательного обновления состояния.
+    async with webhook_update_lock:
+        await telegram_application.process_update(update)
     return JSONResponse({"ok": True})
 
 
