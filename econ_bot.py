@@ -1469,6 +1469,19 @@ async def post_init_setup(application: Application) -> None:
                        "falling back to long polling")
 
     if not webhook_ok:
+        # Фолбэк включаем только если вебхук реально НЕ активен. Иначе
+        # delete_webhook внутри фолбэка затёр бы рабочий вебхук, а два
+        # процесса на Render (или рестартующий воркер) перегоняли бы
+        # Telegram между webhook и polling — отсюда "Wrong response from
+        # the webhook: 403 Forbidden" в getWebhookInfo.
+        try:
+            info = await application.bot.get_webhook_info()
+            expected = f"{base_url}/telegram/webhook" if base_url else None
+            if info.url and info.url == expected:
+                logger.info("Webhook already active on another worker: %s", info.url)
+                return
+        except Exception:
+            logger.exception("get_webhook_info failed; continuing with fallback")
         await start_fallback_polling(application)
 
     try:
@@ -1518,11 +1531,24 @@ async def lifespan(_: FastAPI):
     try:
         await _retry(application.initialize, "Application.initialize")
         initialized = True
+        await _retry(application.start, "Application.start")
         # При ручном FastAPI lifecycle post_init не вызывается автоматически —
         # именно здесь выполняется setWebhook (или включается polling-фолбэк).
-        await _retry(lambda: post_init_setup(application), "post_init/setWebhook")
-        await _retry(application.start, "Application.start")
-        logger.info("Telegram bot started in webhook mode")
+        # ВАЖНО: post_init идёт ПОСЛЕ start(). Иначе на Render с репликами/
+        # рестартами второй воркер мог удалить вебхук (delete_webhook во
+        # фолбэке), который только что зарегистрировал первый, и Telegram
+        # получал 403 от ещё не поднятого процесса.
+        try:
+            await _retry(lambda: post_init_setup(application), "post_init/setWebhook")
+        except Exception:
+            # setWebhook недоступен даже после повторов — не роняем процесс:
+            # переключаемся на long polling, бот продолжит отвечать.
+            logger.exception("post_init failed after retries — starting polling fallback")
+            try:
+                await start_fallback_polling(application)
+            except Exception:
+                logger.exception("polling fallback also failed")
+        logger.info("Telegram bot started")
         yield
     finally:
         if initialized:
