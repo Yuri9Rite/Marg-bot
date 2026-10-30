@@ -8,5 +8,10 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
+      # Необязательно. Если зададите значение (например, hex от
+      # `python -c "import secrets; print(secrets.token_hex(32))"`) — бот
+      # включит проверку источника вебхука. Base64 с '+', '/', '=' тоже
+      # поддерживается: недопустимые символы вырезаются автоматически.
+      # Без этой переменной бот работает корректно (вебхук без секрета).
       - key: WEBHOOK_SECRET
-        generateValue: true
+        sync: false

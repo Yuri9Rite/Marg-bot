@@ -8,15 +8,13 @@
   BOT_TOKEN          — токен Telegram-бота (обязательно)
   RENDER_EXTERNAL_URL / PUBLIC_URL — публичный HTTPS-URL сервиса (webhook-режим;
                        на Render задавать не нужно, он предоставляется сам)
-  WEBHOOK_SECRET     — секрет для защиты вебхука (обязателен в webhook-режиме)
+  WEBHOOK_SECRET     — секрет для защиты вебхука (желателен, но не обязателен)
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import datetime
-import hashlib
 import logging
 import math
 import os
@@ -1385,50 +1383,94 @@ async def set_my_commands_only(application: Application) -> None:
 _TELEGRAM_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 
 
-def make_telegram_webhook_secret() -> str:
-    """Возвращает секрет, который Telegram принимает в setWebhook.
+def make_telegram_webhook_secret() -> str | None:
+    """Возвращает секрет для setWebhook или None, если он не задан.
 
-    Render генерирует значения generateValue в Base64, где могут встречаться
-    запрещённые Telegram символы (+, / и =). В таком случае детерминированно
-    преобразуем секрет в URL-safe Base64 от SHA-256 исходного значения.
+    Telegram допускает в secret_token только A-Z a-z 0-9 _ - (1..256 символов).
+    Render через ``generateValue: true`` выдаёт Base64 с '+', '/' и '=' —
+    такой секрет Telegram отвергает, и регистрация вебхука падала целиком.
+    Поэтому «небезопасные» символы детерминированно вырезаются; если после
+    очистки ничего не осталось — считаем секрет unset (вебхук регистрируется
+    без секрета, а не ломается). WEBHOOK_SECRET остаётся необязательным:
+    бот обязан работать только с BOT_TOKEN.
     """
     raw_secret = os.environ.get("WEBHOOK_SECRET", "").strip()
     if not raw_secret:
-        raise RuntimeError(
-            "WEBHOOK_SECRET is required; configure it in the Render environment"
-        )
+        return None
     if _TELEGRAM_SECRET_RE.fullmatch(raw_secret):
         return raw_secret
-    digest = hashlib.sha256(raw_secret.encode("utf-8")).digest()
-    safe_secret = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
-    logger.warning(
-        "WEBHOOK_SECRET contained unsupported characters; using a URL-safe derived secret"
-    )
-    return safe_secret
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", raw_secret)[:256]
+    if cleaned:
+        logger.warning(
+            "WEBHOOK_SECRET contained unsupported characters; "
+            "using a sanitized version of it"
+        )
+    else:
+        logger.warning("WEBHOOK_SECRET has no valid characters; registering webhook without a secret")
+    return cleaned or None
 
 
 webhook_secret_token: str | None = None
 webhook_update_lock: asyncio.Lock | None = None
 
 
+async def start_fallback_polling(application: Application) -> None:
+    """Удаляет вебхук и запускает long polling в фоне.
+
+    Используется, если регистрация вебхука невозможна (нет публичного URL
+    или Telegram API недоступен): бот продолжает отвечать на сообщения,
+    забирая обновления сам.
+    """
+    global webhook_secret_token
+    webhook_secret_token = None  # без вебхука секрет не проверяем
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=False)
+        logger.info("Stale webhook deleted — fallback polling will receive updates")
+    except Exception:
+        logger.exception("delete_webhook before fallback polling failed")
+    application.create_task(application.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+        bootstrap_retries=-1,
+    ), name="fallback_polling")
+    logger.info("Long-polling fallback started")
+
+
 async def post_init_setup(application: Application) -> None:
-    """Регистрирует webhook и команды после инициализации приложения."""
+    """Регистрирует webhook и команды после инициализации приложения.
+
+    Если публичный HTTPS-URL недоступен или setWebhook не прошёл, бот
+    автоматически переключается на long polling — Telegram-обновления
+    начинают поступать даже без настроенного вебхука.
+    """
     global webhook_secret_token
     base_url = get_public_base_url()
-    if not base_url:
-        raise RuntimeError(
-            "No public HTTPS URL: set RENDER_EXTERNAL_URL or PUBLIC_URL"
-        )
+    webhook_ok = False
+    if base_url:
+        webhook_secret_token = make_telegram_webhook_secret()
+        try:
+            await application.bot.set_webhook(
+                url=f"{base_url}/telegram/webhook",
+                secret_token=webhook_secret_token,
+                allowed_updates=Update.ALL_TYPES,
+                max_connections=1,
+                # False: не выбрасывать накопившиеся сообщения (например,
+                # /start, отправленный во время деплоя/простоя).
+                drop_pending_updates=False,
+            )
+            webhook_ok = True
+            logger.info("Telegram webhook configured: %s%s",
+                        f"{base_url}/telegram/webhook",
+                        "" if webhook_secret_token else " (без секрет-токена)")
+        except Exception:
+            logger.exception("setWebhook failed — falling back to long polling")
+    else:
+        logger.warning("RENDER_EXTERNAL_URL / PUBLIC_URL not set — "
+                       "falling back to long polling")
 
-    webhook_secret_token = make_telegram_webhook_secret()
-    await application.bot.set_webhook(
-        url=f"{base_url}/telegram/webhook",
-        secret_token=webhook_secret_token,
-        allowed_updates=Update.ALL_TYPES,
-        max_connections=1,
-        drop_pending_updates=False,
-    )
-    logger.info("Telegram webhook registered")
+    if not webhook_ok:
+        await start_fallback_polling(application)
+
     try:
         await set_my_commands_only(application)
     except Exception:
@@ -1452,12 +1494,34 @@ async def lifespan(_: FastAPI):
     telegram_application = application
     webhook_update_lock = asyncio.Lock()
     initialized = False
+
+    async def _retry(coro_factory, description: str) -> None:
+        """Повторяет критичный шаг startup с backoff.
+
+        Telegram API иногда отвечает 5xx на getMe/setWebhook; без повторов
+        lifespan падал бы и воркер уходил в crash-loop (бот молчал).
+        """
+        retries = 5
+        for attempt in range(1, retries + 1):
+            try:
+                await coro_factory()
+                return
+            except Exception:
+                if attempt == retries:
+                    raise
+                delay = min(2 ** attempt, 30)
+                logger.warning(
+                    "%s failed (attempt %d/%d), retrying in %ds",
+                    description, attempt, retries, delay, exc_info=True)
+                await asyncio.sleep(delay)
+
     try:
-        await application.initialize()
+        await _retry(application.initialize, "Application.initialize")
         initialized = True
-        # При ручном FastAPI lifecycle post_init не вызывается автоматически.
-        await post_init_setup(application)
-        await application.start()
+        # При ручном FastAPI lifecycle post_init не вызывается автоматически —
+        # именно здесь выполняется setWebhook (или включается polling-фолбэк).
+        await _retry(lambda: post_init_setup(application), "post_init/setWebhook")
+        await _retry(application.start, "Application.start")
         logger.info("Telegram bot started in webhook mode")
         yield
     finally:
@@ -1484,21 +1548,47 @@ async def healthcheck() -> dict[str, str]:
     return {"status": "ok", "bot": "Marg-bot"}
 
 
+@app.get("/debug/env")
+async def debug_env() -> dict[str, object]:
+    """Диагностика: видно ли боту нужные переменные окружения (значения не выдаются)."""
+    base_url = get_public_base_url()
+    info: dict[str, object] = {
+        "BOT_TOKEN_set": bool(os.environ.get("BOT_TOKEN")),
+        "WEBHOOK_SECRET_set": bool(os.environ.get("WEBHOOK_SECRET")),
+        "RENDER_EXTERNAL_URL": os.environ.get("RENDER_EXTERNAL_URL"),
+        "PUBLIC_URL": os.environ.get("PUBLIC_URL"),
+        "resolved_base_url": base_url,
+        "webhook_url_would_be": f"{base_url}/telegram/webhook" if base_url else None,
+        "bot_initialized": telegram_application is not None,
+    }
+    if telegram_application is not None:
+        try:
+            wh = await telegram_application.bot.get_webhook_info()
+            info["telegram_webhook"] = {
+                "url": wh.url,
+                "pending_update_count": wh.pending_update_count,
+                "last_error_message": wh.last_error_message,
+            }
+        except Exception as exc:
+            info["telegram_webhook_error"] = str(exc)
+    return info
+
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ) -> JSONResponse:
-    if (telegram_application is None or webhook_secret_token is None
-            or webhook_update_lock is None):
+    if telegram_application is None or webhook_update_lock is None:
         raise HTTPException(status_code=503, detail="Bot is not initialized yet")
 
-    if (x_telegram_bot_api_secret_token is None
-            or not _TELEGRAM_SECRET_RE.fullmatch(x_telegram_bot_api_secret_token)
-            or not secrets.compare_digest(
-                x_telegram_bot_api_secret_token, webhook_secret_token
-            )):
-        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+    # Секрет проверяем только если он был задан и зарегистрирован в setWebhook.
+    if webhook_secret_token:
+        if (x_telegram_bot_api_secret_token is None
+                or not secrets.compare_digest(
+                    x_telegram_bot_api_secret_token, webhook_secret_token
+                )):
+            raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     try:
         payload = await request.json()
