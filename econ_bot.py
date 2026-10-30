@@ -1538,6 +1538,19 @@ async def lifespan(_: FastAPI):
         # рестартами второй воркер мог удалить вебхук (delete_webhook во
         # фолбэке), который только что зарегистрировал первый, и Telegram
         # получал 403 от ещё не поднятого процесса.
+        # Сбрасываем «залипшую» ошибку доставки (например, 502 от старого
+        # кода во время деплоя): Telegram хранит её до первой успешной
+        # доставки и показывает в getWebhookInfo, пугая diagnostics.
+        try:
+            await application.bot.set_webhook(
+                url=f"{get_public_base_url()}/telegram/webhook",
+                secret_token=None,
+                allowed_updates=Update.ALL_TYPES,
+                max_connections=1,
+                drop_pending_updates=False,
+            )
+        except Exception:
+            logger.debug("webhook re-set for error clearing failed (ignored)")
         try:
             await _retry(lambda: post_init_setup(application), "post_init/setWebhook")
         except Exception:
