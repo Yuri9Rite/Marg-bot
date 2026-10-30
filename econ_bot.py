@@ -1,4 +1,4 @@
-"""Marg-bot — Telegram-бот для расчёта микроэкономических показателей.
+d"""Marg-bot — Telegram-бот для расчёта микроэкономических показателей.
 
 Поддерживает два режима запуска:
   * polling (по умолчанию, локальная разработка):  python econ_bot.py
@@ -302,7 +302,7 @@ async def safe_edit_message(query, text: str, reply_markup=None) -> None:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Приветствие и главное меню."""
     # Инициализация истории (deque со встроенным ограничением размера)
-    if "history" not in context.user_
+    if "history" not in context.user_data:
         context.user_data["history"] = deque(maxlen=MAX_HISTORY_ENTRIES)
 
     welcome = (
